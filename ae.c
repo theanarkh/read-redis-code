@@ -51,11 +51,11 @@
     #include "ae_select.c"
     #endif
 #endif
-
+// 创建事件循环
 aeEventLoop *aeCreateEventLoop(void) {
     aeEventLoop *eventLoop;
     int i;
-
+    // 分配内存
     eventLoop = zmalloc(sizeof(*eventLoop));
     if (!eventLoop) return NULL;
     eventLoop->timeEventHead = NULL;
@@ -63,6 +63,7 @@ aeEventLoop *aeCreateEventLoop(void) {
     eventLoop->stop = 0;
     eventLoop->maxfd = -1;
     eventLoop->beforesleep = NULL;
+    // 设置 IO 多路复用相关字段
     if (aeApiCreate(eventLoop) == -1) {
         zfree(eventLoop);
         return NULL;
@@ -82,16 +83,17 @@ void aeDeleteEventLoop(aeEventLoop *eventLoop) {
 void aeStop(aeEventLoop *eventLoop) {
     eventLoop->stop = 1;
 }
-
+// 订阅 / 取消订阅 fd 的事件，处理函数为 proc，如果有的话
 int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
         aeFileProc *proc, void *clientData)
 {
     if (fd >= AE_SETSIZE) return AE_ERR;
     aeFileEvent *fe = &eventLoop->events[fd];
-
+    // 调 IO 多路复用模块的函数
     if (aeApiAddEvent(eventLoop, fd, mask) == -1)
         return AE_ERR;
     fe->mask |= mask;
+    // 读写才需要设置 handler
     if (mask & AE_READABLE) fe->rfileProc = proc;
     if (mask & AE_WRITABLE) fe->wfileProc = proc;
     fe->clientData = clientData;
@@ -193,6 +195,7 @@ int aeDeleteTimeEvent(aeEventLoop *eventLoop, long long id)
  *    Much better but still insertion or deletion of timers is O(N).
  * 2) Use a skiplist to have this operation as O(1) and insertion as O(log(N)).
  */
+// 查找最快到期的定时器
 static aeTimeEvent *aeSearchNearestTimer(aeEventLoop *eventLoop)
 {
     aeTimeEvent *te = eventLoop->timeEventHead;
@@ -224,13 +227,16 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
             te = te->next;
             continue;
         }
+        // 获取当前时间
         aeGetTime(&now_sec, &now_ms);
+        // 当前时间比设置的大说明过期了
         if (now_sec > te->when_sec ||
             (now_sec == te->when_sec && now_ms >= te->when_ms))
         {
             int retval;
 
             id = te->id;
+            // 指向回调
             retval = te->timeProc(eventLoop, id, te->clientData);
             processed++;
             /* After an event is processed our time event list may
@@ -246,6 +252,7 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
              * to flag deleted elements in a special way for later
              * deletion (putting references to the nodes to delete into
              * another linked list). */
+            // 再次设置该定时器，否则删除它
             if (retval != AE_NOMORE) {
                 aeAddMillisecondsToNow(retval,&te->when_sec,&te->when_ms);
             } else {
@@ -290,7 +297,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
         struct timeval tv, *tvp;
 
         if (flags & AE_TIME_EVENTS && !(flags & AE_DONT_WAIT))
-            shortest = aeSearchNearestTimer(eventLoop);
+            shortest = aeSearchNearestTimer(eventLoop); // 查找最快到期的定时器
         if (shortest) {
             long now_sec, now_ms;
 
@@ -311,6 +318,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
             /* If we have to check for events but need to return
              * ASAP because of AE_DONT_WAIT we need to se the timeout
              * to zero */
+            // 没有定时器并且没有事件触发时，IO 多路复用模块会 1. 一直阻塞直到事件触发 2. 直接返回
             if (flags & AE_DONT_WAIT) {
                 tv.tv_sec = tv.tv_usec = 0;
                 tvp = &tv;
@@ -319,7 +327,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
                 tvp = NULL; /* wait forever */
             }
         }
-
+        // numevents 为触发了事件的 fd 个数
         numevents = aeApiPoll(eventLoop, tvp);
         for (j = 0; j < numevents; j++) {
             aeFileEvent *fe = &eventLoop->events[eventLoop->fired[j].fd];
@@ -330,6 +338,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
 	    /* note the fe->mask & mask & ... code: maybe an already processed
              * event removed an element that fired and we still didn't
              * processed, so we check if the event is still valid. */
+            // 根据触发的事件进行处理
             if (fe->mask & mask & AE_READABLE) {
                 rfired = 1;
                 fe->rfileProc(eventLoop,fd,fe->clientData,mask);
@@ -342,6 +351,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
         }
     }
     /* Check time events */
+    // 初始化定时器
     if (flags & AE_TIME_EVENTS)
         processed += processTimeEvents(eventLoop);
 

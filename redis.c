@@ -1531,9 +1531,10 @@ static void initServerConfig() {
 
 static void initServer() {
     int j;
-
+    // 忽略信号，比如 SIGPIPE 信号默认会导致进程退出
     signal(SIGHUP, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
+    // 注册信号处理函数，比如 SIGKILL
     setupSigSegvAction();
 
     server.devnull = fopen("/dev/null","w");
@@ -1541,19 +1542,26 @@ static void initServer() {
         redisLog(REDIS_WARNING, "Can't open /dev/null: %s", server.neterr);
         exit(1);
     }
+    // 客户端队列
     server.clients = listCreate();
+    // slave 队列
     server.slaves = listCreate();
     server.monitors = listCreate();
     server.objfreelist = listCreate();
+    // 创建共享对象，减少内存，并且避免内存的分配和释放
     createSharedObjects();
+    // 创建事件循环
     server.el = aeCreateEventLoop();
+    // 创建 db，客户端通信前可以选择 db，后续基于该 bd 进行操作
     server.db = zmalloc(sizeof(redisDb)*server.dbnum);
     server.sharingpool = dictCreate(&setDictType,NULL);
+    // 创建 redis 服务器，记录 fd
     server.fd = anetTcpServer(server.neterr, server.port, server.bindaddr);
     if (server.fd == -1) {
         redisLog(REDIS_WARNING, "Opening TCP port: %s", server.neterr);
         exit(1);
     }
+    // 初始化 db
     for (j = 0; j < server.dbnum; j++) {
         server.db[j].dict = dictCreate(&dbDictType,NULL);
         server.db[j].expires = dictCreate(&keyptrDictType,NULL);
@@ -1572,7 +1580,9 @@ static void initServer() {
     server.stat_numconnections = 0;
     server.stat_starttime = time(NULL);
     server.unixtime = time(NULL);
+    // 创建定时器，处理函数式 serverCron
     aeCreateTimeEvent(server.el, 1, serverCron, NULL, NULL);
+    // 注册 server 的 fd 到 IO 多路复用模块，等待可读事件，处理函数为 acceptHandler
     if (aeCreateFileEvent(server.el, server.fd, AE_READABLE,
         acceptHandler, NULL) == AE_ERR) oom("creating file event");
 
@@ -2051,11 +2061,16 @@ static void call(redisClient *c, struct redisCommand *cmd) {
     long long dirty;
 
     dirty = server.dirty;
+    // 执行真正的命令
     cmd->proc(c);
+    // 开启了 appendonly 说明每个命令都会写记录到文件中，保证数据可靠性，
+    // server.dirty-dirty 非 0 说明该命令的操作需要记录到文件中，比如 get 命令不需要
     if (server.appendonly && server.dirty-dirty)
         feedAppendOnlyFile(cmd,c->db->id,c->argv,c->argc);
+    // 同步到 slve
     if (server.dirty-dirty && listLength(server.slaves))
         replicationFeedSlaves(server.slaves,cmd,c->db->id,c->argv,c->argc);
+    // 同步给 monitor 客户端
     if (listLength(server.monitors))
         replicationFeedSlaves(server.monitors,cmd,c->db->id,c->argv,c->argc);
     server.stat_numcommands++;
@@ -2152,6 +2167,7 @@ static int processCommand(redisClient *c) {
 
     /* Now lookup the command and check ASAP about trivial error conditions
      * such wrong arity, bad command name and so forth. */
+    // 命令的第一个项是 key，比如 get keyname
     cmd = lookupCommand(c->argv[0]->ptr);
     if (!cmd) {
         addReplySds(c,
@@ -2161,6 +2177,7 @@ static int processCommand(redisClient *c) {
         return 1;
     } else if ((cmd->arity > 0 && cmd->arity != c->argc) ||
                (c->argc < -cmd->arity)) {
+        // 数据不符合命令的规范
         addReplySds(c,
             sdscatprintf(sdsempty(),
                 "-ERR wrong number of arguments for '%s' command\r\n",
@@ -2210,6 +2227,7 @@ static int processCommand(redisClient *c) {
         tryObjectEncoding(c->argv[c->argc-1]);
 
     /* Check if the user is authenticated */
+    // 配置了身份验证，但是没有验证并且当前命令不是验证命令，即开启验证时，第一条命令需要是验证命令
     if (server.requirepass && !c->authenticated && cmd->proc != authCommand) {
         addReplySds(c,sdsnew("-ERR operation not permitted\r\n"));
         resetClient(c);
@@ -2223,6 +2241,7 @@ static int processCommand(redisClient *c) {
     } else {
         if (server.vm_enabled && server.vm_max_threads > 0 &&
             blockClientOnSwappedKeys(cmd,c)) return 1;
+        // 处理一般命令
         call(c,cmd);
     }
 
@@ -2310,8 +2329,10 @@ again:
      * in the input buffer the client may be blocked, and the "goto again"
      * will try to reiterate. The following line will make it return asap. */
     if (c->flags & REDIS_BLOCKED || c->flags & REDIS_IO_WAIT) return;
+    // 初始化时为 -1
     if (c->bulklen == -1) {
         /* Read the first line of the query */
+        // 找到 \n 按行处理
         char *p = strchr(c->querybuf,'\n');
         size_t querylen;
 
@@ -2321,35 +2342,45 @@ again:
             
             query = c->querybuf;
             c->querybuf = sdsempty();
+            // 当前待处理数据的长度
             querylen = 1+(p-(query));
+            // \n 后还有多余的数据，即下一条命令，保存到 buf 里
             if (sdslen(query) > querylen) {
                 /* leave data after the first line of the query in the buffer */
                 c->querybuf = sdscatlen(c->querybuf,query+querylen,sdslen(query)-querylen);
             }
+            // 修改 \n 为 \0 sdsupdatelen 才能正确统计命令的长度
             *p = '\0'; /* remove "\n" */
             if (*(p-1) == '\r') *(p-1) = '\0'; /* and "\r" if any */
+            // 更新 query 的长度，为该条命令的字符串长度
             sdsupdatelen(query);
 
             /* Now we can split the query in arguments */
+            // 以一个空格为分隔符切分命令为多个项，argc 为数量
             argv = sdssplitlen(query,sdslen(query)," ",1,&argc);
+            // 释放 query 的内存
             sdsfree(query);
-
+            // 释放处理上一条命令时分配的内存
             if (c->argv) zfree(c->argv);
+            // 继续处理命令
             c->argv = zmalloc(sizeof(robj*)*argc);
-
+            // 把 string 转成 robj
             for (j = 0; j < argc; j++) {
                 if (sdslen(argv[j])) {
+                    // 创建一个 robj 或者从空闲队列中获取一个空闲的
                     c->argv[c->argc] = createObject(REDIS_STRING,argv[j]);
                     c->argc++;
                 } else {
                     sdsfree(argv[j]);
                 }
             }
+            // 转成 robj 后释放 argv
             zfree(argv);
             if (c->argc) {
                 /* Execute the command. If the client is still valid
                  * after processCommand() return and there is something
                  * on the query buffer try to process the next command. */
+                // 处理一个命令，如果还有数据则继续下一轮处理
                 if (processCommand(c) && sdslen(c->querybuf)) goto again;
             } else {
                 /* Nothing to process, argc == 0. Just process the query
@@ -2357,7 +2388,7 @@ again:
                 if (sdslen(c->querybuf)) goto again;
             }
             return;
-        } else if (sdslen(c->querybuf) >= REDIS_REQUEST_MAX_SIZE) {
+        } else if (sdslen(c->querybuf) >= REDIS_REQUEST_MAX_SIZE) { // 过长则释放 client
             redisLog(REDIS_VERBOSE, "Client protocol error");
             freeClient(c);
             return;
@@ -2389,7 +2420,7 @@ static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mas
     int nread;
     REDIS_NOTUSED(el);
     REDIS_NOTUSED(mask);
-
+    // 读取客户端发送到数据
     nread = read(fd, buf, REDIS_IOBUF_LEN);
     if (nread == -1) {
         if (errno == EAGAIN) {
@@ -2399,17 +2430,21 @@ static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mas
             freeClient(c);
             return;
         }
-    } else if (nread == 0) {
+    } else if (nread == 0) { // 客户端发送了 fin
         redisLog(REDIS_VERBOSE, "Client closed connection");
         freeClient(c);
         return;
     }
+    // 处理数据
     if (nread) {
+        // 和之前的数据拼接起来
         c->querybuf = sdscatlen(c->querybuf, buf, nread);
+        // 记录最后收到数据的时间
         c->lastinteraction = time(NULL);
     } else {
         return;
     }
+    // 处理数据
     if (!(c->flags & REDIS_BLOCKED))
         processInputBuffer(c);
 }
@@ -2427,13 +2462,16 @@ static void *dupClientReplyValue(void *o) {
 }
 
 static redisClient *createClient(int fd) {
+    // 分配 redisClient 结构体
     redisClient *c = zmalloc(sizeof(*c));
-
+    // 设置非阻塞模式
     anetNonBlock(NULL,fd);
     anetTcpNoDelay(NULL,fd);
     if (!c) return NULL;
+    // 默认选择第一个 db
     selectDb(c,0);
     c->fd = fd;
+    // 接收到命令
     c->querybuf = sdsempty();
     c->argc = 0;
     c->argv = NULL;
@@ -2443,6 +2481,7 @@ static redisClient *createClient(int fd) {
     c->mbargv = NULL;
     c->sentlen = 0;
     c->flags = 0;
+    // 最后交互的时间，每次收到数据时需要更新
     c->lastinteraction = time(NULL);
     c->authenticated = 0;
     c->replstate = REDIS_REPL_NONE;
@@ -2453,11 +2492,13 @@ static redisClient *createClient(int fd) {
     c->blockingkeysnum = 0;
     c->io_keys = listCreate();
     listSetFreeMethod(c->io_keys,decrRefCount);
+    // 注册通信 fd 到 IO 多路复用模块，等待可读事件，即等待客户端发送数据过来，处理函数为 readQueryFromClient
     if (aeCreateFileEvent(server.el, c->fd, AE_READABLE,
         readQueryFromClient, c) == AE_ERR) {
         freeClient(c);
         return NULL;
     }
+    // 插入 client 队列
     listAddNodeTail(server.clients,c);
     initClientMultiState(c);
     return c;
@@ -2555,13 +2596,14 @@ static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     REDIS_NOTUSED(el);
     REDIS_NOTUSED(mask);
     REDIS_NOTUSED(privdata);
-
+    // 获取新连接的 fd
     cfd = anetAccept(server.neterr, fd, cip, &cport);
     if (cfd == AE_ERR) {
         redisLog(REDIS_VERBOSE,"Accepting client connection: %s", server.neterr);
         return;
     }
     redisLog(REDIS_VERBOSE,"Accepted %s:%d", cip, cport);
+    // 创建一个 redisClient 结构体和客户端通信
     if ((c = createClient(cfd)) == NULL) {
         redisLog(REDIS_WARNING,"Error allocating resoures for the client");
         close(cfd); /* May be already closed, just ingore errors */
@@ -2571,6 +2613,7 @@ static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
      * connection. Note that we create the client instead to check before
      * for this condition, since now the socket is already set in nonblocking
      * mode and we can send an error for free using the Kernel I/O */
+    // 连接过载则关掉
     if (server.maxclients && listLength(server.clients) > server.maxclients) {
         char *err = "-ERR max number of clients reached\r\n";
 
@@ -3724,8 +3767,9 @@ static void echoCommand(redisClient *c) {
 
 static void setGenericCommand(redisClient *c, int nx) {
     int retval;
-
+    // 释放有设置过期值，比如 setnx 命令，设置了并且过期了则删除
     if (nx) deleteIfVolatile(c->db,c->argv[1]);
+    // 插入 dict 中
     retval = dictAdd(c->db->dict,c->argv[1],c->argv[2]);
     if (retval == DICT_ERR) {
         if (!nx) {
@@ -3745,11 +3789,13 @@ static void setGenericCommand(redisClient *c, int nx) {
         incrRefCount(c->argv[1]);
         incrRefCount(c->argv[2]);
     }
+    // 设置需要同步到 slave 或 monitor
     server.dirty++;
+    // 从过期 dict 中删除，如果相关的话
     removeExpire(c->db,c->argv[1]);
     addReply(c, nx ? shared.cone : shared.ok);
 }
-
+// set key value
 static void setCommand(redisClient *c) {
     setGenericCommand(c,0);
 }
@@ -3772,7 +3818,7 @@ static int getGenericCommand(redisClient *c) {
         return REDIS_OK;
     }
 }
-
+// get key
 static void getCommand(redisClient *c) {
     getGenericCommand(c);
 }
@@ -7354,11 +7400,14 @@ static int tryFreeOneObjectFromFreelist(void) {
     robj *o;
 
     if (server.vm_enabled) pthread_mutex_lock(&server.obj_freelist_mutex);
+    // 释放 robj 空闲队列的一个节点
     if (listLength(server.objfreelist)) {
         listNode *head = listFirst(server.objfreelist);
         o = listNodeValue(head);
+        // 删除节点
         listDelNode(server.objfreelist,head);
         if (server.vm_enabled) pthread_mutex_unlock(&server.obj_freelist_mutex);
+        // 删除节点里指向的值
         zfree(o);
         return REDIS_OK;
     } else {
@@ -7379,6 +7428,7 @@ static int tryFreeOneObjectFromFreelist(void) {
  * memory usage.
  */
 static void freeMemoryIfNeeded(void) {
+    // 设置了内存阈值并且当前分配的内存达到了阈值，则看有没有可释放的内存
     while (server.maxmemory && zmalloc_used_memory() > server.maxmemory) {
         int j, k, freed = 0;
 
@@ -7387,7 +7437,7 @@ static void freeMemoryIfNeeded(void) {
             int minttl = -1;
             robj *minkey = NULL;
             struct dictEntry *de;
-
+            // 主动删除过期的元素，一般是访问该 key 时才懒删除
             if (dictSize(server.db[j].expires)) {
                 freed = 1;
                 /* From a sample of three keys drop the one nearest to
@@ -9100,20 +9150,24 @@ void linuxOvercommitMemoryWarning(void) {
 static void daemonize(void) {
     int fd;
     FILE *fp;
-
+    // 出错（-1）或是父进程（> 0），则退出
     if (fork() != 0) exit(0); /* parent exits */
+    // 开启新的会话，脱离终端
     setsid(); /* create a new session */
 
     /* Every output goes to /dev/null. If Redis is daemonized but
      * the 'logfile' is set to 'stdout' in the configuration file
      * it will not log at all. */
+    // 打开 /dev/null 比把标准输入输出重定向到 /dev/null
     if ((fd = open("/dev/null", O_RDWR, 0)) != -1) {
         dup2(fd, STDIN_FILENO);
         dup2(fd, STDOUT_FILENO);
         dup2(fd, STDERR_FILENO);
+        // 没用了，关闭之前打开的 fd
         if (fd > STDERR_FILENO) close(fd);
     }
     /* Try to write the pid file */
+    // 把守护进程 id 写到文件
     fp = fopen(server.pidfile,"w");
     if (fp) {
         fprintf(fp,"%d\n",getpid());
@@ -9123,8 +9177,9 @@ static void daemonize(void) {
 
 int main(int argc, char **argv) {
     time_t start;
-
+    // 初始化配置，主要是设置全局变量 server 的字段
     initServerConfig();
+    // 指定了配置文件
     if (argc == 2) {
         resetServerSaveParams();
         loadServerConfig(argv[1]);
@@ -9134,13 +9189,16 @@ int main(int argc, char **argv) {
     } else {
         redisLog(REDIS_WARNING,"Warning: no config file specified, using the default config. In order to specify a config file use 'redis-server /path/to/redis.conf'");
     }
+    // 以守护进程的方式运行
     if (server.daemonize) daemonize();
+    // 初始化服务器
     initServer();
     redisLog(REDIS_NOTICE,"Server started, Redis version " REDIS_VERSION);
 #ifdef __linux__
     linuxOvercommitMemoryWarning();
 #endif
     start = time(NULL);
+    // 数据恢复
     if (server.appendonly) {
         if (loadAppendOnlyFile(server.appendfilename) == REDIS_OK)
             redisLog(REDIS_NOTICE,"DB loaded from append only file: %ld seconds",time(NULL)-start);
@@ -9150,6 +9208,7 @@ int main(int argc, char **argv) {
     }
     redisLog(REDIS_NOTICE,"The server is now ready to accept connections on port %d", server.port);
     aeSetBeforeSleepProc(server.el,beforeSleep);
+    // 开启事件循环
     aeMain(server.el);
     aeDeleteEventLoop(server.el);
     return 0;

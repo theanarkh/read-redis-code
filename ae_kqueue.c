@@ -61,11 +61,12 @@ static void aeApiDelEvent(aeEventLoop *eventLoop, int fd, int mask) {
 static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
     aeApiState *state = eventLoop->apidata;
     int retval, numevents = 0;
-
+    // 进入 IO 多路复用模块
     if (tvp != NULL) {
         struct timespec timeout;
         timeout.tv_sec = tvp->tv_sec;
         timeout.tv_nsec = tvp->tv_usec * 1000;
+        // 成功时返回触发了事件的 fd 个数，state->events 保存了触发的事件
         retval = kevent(state->kqfd, NULL, 0, state->events, AE_SETSIZE, &timeout);
     } else {
         retval = kevent(state->kqfd, NULL, 0, state->events, AE_SETSIZE, NULL);
@@ -75,10 +76,11 @@ static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
         int j;
         
         numevents = retval;
+        // 遍历触发了事件的 fd 个数
         for(j = 0; j < numevents; j++) {
             int mask = 0;
             struct kevent *e = state->events+j;
-            
+            // 触发了什么事件
             if (e->filter == EVFILT_READ) mask |= AE_READABLE;
             if (e->filter == EVFILT_WRITE) mask |= AE_WRITABLE;
             eventLoop->fired[j].fd = e->ident; 

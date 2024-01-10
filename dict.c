@@ -59,7 +59,7 @@ static void _dictPanic(const char *fmt, ...)
 }
 
 /* ------------------------- Heap Management Wrappers------------------------ */
-
+// 分配 dict 数据结构的内存
 static void *_dictAlloc(size_t size)
 {
     void *p = zmalloc(size);
@@ -67,7 +67,7 @@ static void *_dictAlloc(size_t size)
         _dictPanic("Out of memory");
     return p;
 }
-
+// 释放 dict 数据结构的内存
 static void _dictFree(void *ptr) {
     zfree(ptr);
 }
@@ -113,6 +113,7 @@ unsigned int dictGenHashFunction(const unsigned char *buf, int len) {
 
 /* Reset an hashtable already initialized with ht_init().
  * NOTE: This function should only called by ht_destroy(). */
+// 重置 dict 的值
 static void _dictReset(dict *ht)
 {
     ht->table = NULL;
@@ -122,6 +123,7 @@ static void _dictReset(dict *ht)
 }
 
 /* Create a new hash table */
+// 创建一个 dict
 dict *dictCreate(dictType *type,
         void *privDataPtr)
 {
@@ -132,6 +134,7 @@ dict *dictCreate(dictType *type,
 }
 
 /* Initialize the hash table */
+// 初始化 dict
 int _dictInit(dict *ht, dictType *type,
         void *privDataPtr)
 {
@@ -143,6 +146,7 @@ int _dictInit(dict *ht, dictType *type,
 
 /* Resize the table to the minimal size that contains all the elements,
  * but with the invariant of a USER/BUCKETS ration near to <= 1 */
+ // 扩容
 int dictResize(dict *ht)
 {
     int minimal = ht->used;
@@ -153,8 +157,10 @@ int dictResize(dict *ht)
 }
 
 /* Expand or create the hashtable */
+// 真正的扩容
 int dictExpand(dict *ht, unsigned long size)
 {
+    // 新的 dict
     dict n; /* the new hashtable */
     unsigned long realsize = _dictNextPower(size), i;
 
@@ -164,8 +170,10 @@ int dictExpand(dict *ht, unsigned long size)
         return DICT_ERR;
 
     _dictInit(&n, ht->type, ht->privdata);
+    // 桶个数
     n.size = realsize;
     n.sizemask = realsize-1;
+    // 分配桶的内存
     n.table = _dictAlloc(realsize*sizeof(dictEntry*));
 
     /* Initialize all the pointers to NULL */
@@ -174,7 +182,11 @@ int dictExpand(dict *ht, unsigned long size)
     /* Copy all the elements from the old to the new table:
      * note that if the old hash table is empty ht->size is zero,
      * so dictExpand just creates an hash table. */
+    // dict 中当前的元素个数
     n.used = ht->used;
+    // 遍历旧的 dict，重新 hash 到新的 dict 中，
+    // 按照桶的顺序，每个桶按照链表中节点的顺序，i >= size 说明桶遍历完了，
+    // used 为 0 说明全部元素遍历完了，直接结束（桶可能还没遍历完，但是后面的都是空的）
     for (i = 0; i < ht->size && ht->used > 0; i++) {
         dictEntry *he, *nextHe;
 
@@ -196,14 +208,17 @@ int dictExpand(dict *ht, unsigned long size)
         }
     }
     assert(ht->used == 0);
+    // 释放旧的 dict
     _dictFree(ht->table);
 
     /* Remap the new hashtable in the old */
+    // 指向新的 dict
     *ht = n;
     return DICT_OK;
 }
 
 /* Add an element to the target hash table */
+// 往 dict 加入一个元素
 int dictAdd(dict *ht, void *key, void *val)
 {
     int index;
@@ -211,17 +226,21 @@ int dictAdd(dict *ht, void *key, void *val)
 
     /* Get the index of the new element, or -1 if
      * the element already exists. */
+    // 找到 key hash 后对应的桶索引，-1 说明 key 存在了
     if ((index = _dictKeyIndex(ht, key)) == -1)
         return DICT_ERR;
 
     /* Allocates the memory and stores key */
+    // 分配内存并插入链表
     entry = _dictAlloc(sizeof(*entry));
     entry->next = ht->table[index];
     ht->table[index] = entry;
 
     /* Set the hash entry fields. */
+    // 设置 key 和 value
     dictSetHashKey(ht, entry, key);
     dictSetHashVal(ht, entry, val);
+    // 元素个数加一
     ht->used++;
     return DICT_OK;
 }
@@ -253,6 +272,7 @@ int dictReplace(dict *ht, void *key, void *val)
 }
 
 /* Search and remove an element */
+// 找到 key 并删除它
 static int dictGenericDelete(dict *ht, const void *key, int nofree)
 {
     unsigned int h;
@@ -260,26 +280,33 @@ static int dictGenericDelete(dict *ht, const void *key, int nofree)
 
     if (ht->size == 0)
         return DICT_ERR;
+    // 找到对应的桶
     h = dictHashKey(ht, key) & ht->sizemask;
     he = ht->table[h];
-
+    // 因为需要删除元素，所以需要保存上一个遍历的元素，然后修改它的 next 指针
     prevHe = NULL;
     while(he) {
         if (dictCompareHashKeys(ht, key, he->key)) {
             /* Unlink the element from the list */
+            // prevHe 非空说明被删除的元素不是第一个节点，修改前一个节点的 next 指针
             if (prevHe)
                 prevHe->next = he->next;
             else
                 ht->table[h] = he->next;
+            // 是否需要释放 key 和 value 指向的内存【
             if (!nofree) {
                 dictFreeEntryKey(ht, he);
                 dictFreeEntryVal(ht, he);
             }
+            // 释放元素对应的结构体
             _dictFree(he);
+            // dict 元素减 1
             ht->used--;
             return DICT_OK;
         }
+        // 保存前一个元素
         prevHe = he;
+        // 指向下一个
         he = he->next;
     }
     return DICT_ERR; /* not found */
@@ -294,6 +321,7 @@ int dictDeleteNoFree(dict *ht, const void *key) {
 }
 
 /* Destroy an entire hash table */
+// 释放 dict 桶和元素的内存，但是不释放 dict 结构体的内存
 int _dictClear(dict *ht)
 {
     unsigned long i;
@@ -356,24 +384,34 @@ dictIterator *dictGetIterator(dict *ht)
 dictEntry *dictNext(dictIterator *iter)
 {
     while (1) {
+        // 为 NULL 说明当前的桶遍历完了
         if (iter->entry == NULL) {
+            // 遍历下一个桶
             iter->index++;
+            // size 记录了 dict 的桶大小，if 为 true 说明遍历完所有桶了
             if (iter->index >=
                     (signed)iter->ht->size) break;
+            // 指向新桶的链表
             iter->entry = iter->ht->table[iter->index];
         } else {
+            // 当前桶的元素还没遍历完
+            // nextEntry 在每次遍历时指向下一个元素，直接复制给 entry 就行
             iter->entry = iter->nextEntry;
         }
+        // 不是桶 / dict 中的最后一个元素
         if (iter->entry) {
             /* We need to save the 'next' here, the iterator user
              * may delete the entry we are returning. */
+            // 指向下一个元素，避免 entry 被删除后找不到下一个元素了
             iter->nextEntry = iter->entry->next;
+            // 返回当前遍历的元素
             return iter->entry;
         }
     }
     return NULL;
 }
 
+// 释放迭代器
 void dictReleaseIterator(dictIterator *iter)
 {
     _dictFree(iter);
@@ -381,6 +419,7 @@ void dictReleaseIterator(dictIterator *iter)
 
 /* Return a random entry from the hash table. Useful to
  * implement randomized algorithms */
+// 随机找 dict 中的一个元素
 dictEntry *dictGetRandomKey(dict *ht)
 {
     dictEntry *he;
@@ -388,6 +427,7 @@ dictEntry *dictGetRandomKey(dict *ht)
     int listlen, listele;
 
     if (ht->used == 0) return NULL;
+    // 随机找到第一个非空的桶
     do {
         h = random() & ht->sizemask;
         he = ht->table[h];
@@ -398,12 +438,15 @@ dictEntry *dictGetRandomKey(dict *ht)
      * The only sane way to do so is to count the element and
      * select a random index. */
     listlen = 0;
+    // 计算找到的桶中的元素个数
     while(he) {
         he = he->next;
         listlen++;
     }
+    // 随机选择桶中的一个元素索引
     listele = random() % listlen;
     he = ht->table[h];
+    // 返回选中的索引对应的元素
     while(listele--) he = he->next;
     return he;
 }
@@ -411,12 +454,15 @@ dictEntry *dictGetRandomKey(dict *ht)
 /* ------------------------- private functions ------------------------------ */
 
 /* Expand the hash table if needed */
+// 扩容
 static int _dictExpandIfNeeded(dict *ht)
 {
     /* If the hash table is empty expand it to the intial size,
      * if the table is "full" dobule its size. */
+    // dict 初始化时为 0，使用时才分配内存
     if (ht->size == 0)
         return dictExpand(ht, DICT_HT_INITIAL_SIZE);
+    // 元素个数等于桶数则扩容两倍数量的桶
     if (ht->used == ht->size)
         return dictExpand(ht, ht->size*2);
     return DICT_OK;
@@ -438,6 +484,7 @@ static unsigned long _dictNextPower(unsigned long size)
 /* Returns the index of a free slot that can be populated with
  * an hash entry for the given 'key'.
  * If the key already exists, -1 is returned. */
+// 查找一个可以存放该 key 的桶，key 已存在则返回 -1，否则返回桶索引，
 static int _dictKeyIndex(dict *ht, const void *key)
 {
     unsigned int h;
@@ -447,9 +494,11 @@ static int _dictKeyIndex(dict *ht, const void *key)
     if (_dictExpandIfNeeded(ht) == DICT_ERR)
         return -1;
     /* Compute the key hash value */
+    // 计算出 key 对应的桶索引
     h = dictHashKey(ht, key) & ht->sizemask;
     /* Search if this slot does not already contain the given key */
     he = ht->table[h];
+    // 遍历该桶的链表，找到 key 一样的元素则返回 -1
     while(he) {
         if (dictCompareHashKeys(ht, key, he->key))
             return -1;

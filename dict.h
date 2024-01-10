@@ -41,7 +41,7 @@
 
 /* Unused arguments generate annoying warnings... */
 #define DICT_NOTUSED(V) ((void) V)
-
+// dictEntry 表示 dict 中的一个元素
 typedef struct dictEntry {
     void *key;
     void *val;
@@ -57,22 +57,32 @@ typedef struct dictType {
     void (*valDestructor)(void *privdata, void *obj);
 } dictType;
 
+// dict 顶级数据结构
 typedef struct dict {
+    // dict 桶指针，多个桶，每个桶对应一个链表
     dictEntry **table;
     dictType *type;
+    // 桶个数
     unsigned long size;
+    // mask 用于保证 hash 后的索引落在 size 范围
     unsigned long sizemask;
+    // dict 中的元素个数
     unsigned long used;
     void *privdata;
 } dict;
 
+// dict 迭代器
 typedef struct dictIterator {
+    // 需要遍历的 dict
     dict *ht;
+    // 当前遍历的桶索引
     int index;
+    // entry 指向当前遍历的元素，nextEntry 指向下一个待遍历的元素，见 dict.c 的 dictNext 函数
     dictEntry *entry, *nextEntry;
 } dictIterator;
 
 /* This is the initial size of every hash table */
+// 默认的桶个数，也是最小值
 #define DICT_HT_INITIAL_SIZE     4
 
 /* ------------------------------- Macros ------------------------------------*/
