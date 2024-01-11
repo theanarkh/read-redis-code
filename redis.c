@@ -2783,7 +2783,7 @@ static void decrRefCount(void *obj) {
         if (server.vm_enabled) pthread_mutex_unlock(&server.obj_freelist_mutex);
     }
 }
-
+// 从 db 的 dict 中找到 key 的值
 static robj *lookupKey(redisDb *db, robj *key) {
     dictEntry *de = dictFind(db->dict,key);
     if (de) {
@@ -2818,7 +2818,7 @@ static robj *lookupKey(redisDb *db, robj *key) {
         return NULL;
     }
 }
-
+// 查找 key，如果过期则返回 NULL
 static robj *lookupKeyRead(redisDb *db, robj *key) {
     expireIfNeeded(db,key);
     return lookupKey(db,key);
@@ -2830,6 +2830,7 @@ static robj *lookupKeyWrite(redisDb *db, robj *key) {
 }
 
 static robj *lookupKeyReadOrReply(redisClient *c, robj *key, robj *reply) {
+    // 值时 robj 结构体
     robj *o = lookupKeyRead(c->db, key);
     if (!o) addReply(c,reply);
     return o;

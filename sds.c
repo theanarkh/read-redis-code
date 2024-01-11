@@ -45,78 +45,91 @@ static void sdsOomAbort(void) {
 
 sds sdsnewlen(const void *init, size_t initlen) {
     struct sdshdr *sh;
-
+    // sdshdr 结构体 + 字符串有效长度 + \0
     sh = zmalloc(sizeof(struct sdshdr)+initlen+1);
 #ifdef SDS_ABORT_ON_OOM
     if (sh == NULL) sdsOomAbort();
 #else
     if (sh == NULL) return NULL;
 #endif
+    // 记录有效长度
     sh->len = initlen;
+    // 空闲空间
     sh->free = 0;
     if (initlen) {
+        // init 非空则复制 init 的 initlen 个字符过来
         if (init) memcpy(sh->buf, init, initlen);
         else memset(sh->buf,0,initlen);
     }
+    // 设置结束字符
     sh->buf[initlen] = '\0';
+    // 返回字符串的首地址
     return (char*)sh->buf;
 }
 
+// 空字符串，实际上是 sdshdr 结构和 \0
 sds sdsempty(void) {
     return sdsnewlen("",0);
 }
-
+// 创建一个新字符串
 sds sdsnew(const char *init) {
     size_t initlen = (init == NULL) ? 0 : strlen(init);
     return sdsnewlen(init, initlen);
 }
-
+// sds 字符长度
 size_t sdslen(const sds s) {
+    // s 减去 sdshdr 大小得到 sdshdr 首地址
     struct sdshdr *sh = (void*) (s-(sizeof(struct sdshdr)));
     return sh->len;
 }
-
+// 深复制字符串
 sds sdsdup(const sds s) {
     return sdsnewlen(s, sdslen(s));
 }
-
+// 释放字符串
 void sdsfree(sds s) {
     if (s == NULL) return;
+    // 拿到真正的地址
     zfree(s-sizeof(struct sdshdr));
 }
-
+// 返回字符串中空闲字符数
 size_t sdsavail(sds s) {
     struct sdshdr *sh = (void*) (s-(sizeof(struct sdshdr)));
     return sh->free;
 }
 
+// 更新字符串长度，说明 s 中有 \0，通过 strlen 获取当前长度然后更新 sdshdr
 void sdsupdatelen(sds s) {
     struct sdshdr *sh = (void*) (s-(sizeof(struct sdshdr)));
     int reallen = strlen(s);
     sh->free += (sh->len-reallen);
     sh->len = reallen;
 }
-
+// 创建一个可以容纳 s 长度 + addlen 的字符串，如果 s 的空闲字节数足够则直接返回 s
 static sds sdsMakeRoomFor(sds s, size_t addlen) {
     struct sdshdr *sh, *newsh;
     size_t free = sdsavail(s);
     size_t len, newlen;
-
+    // 空间足够，直接返回
     if (free >= addlen) return s;
+    // 当前长度
     len = sdslen(s);
     sh = (void*) (s-(sizeof(struct sdshdr)));
+    // 实际长度 * 2
     newlen = (len+addlen)*2;
+    // 分配新的内存
     newsh = zrealloc(sh, sizeof(struct sdshdr)+newlen+1);
 #ifdef SDS_ABORT_ON_OOM
     if (newsh == NULL) sdsOomAbort();
 #else
     if (newsh == NULL) return NULL;
 #endif
-
+    // 更新空闲字节数
     newsh->free = newlen - len;
+    // 返回新的地址
     return newsh->buf;
 }
-
+// 字符串拼接，可能需要申请新的内存空间
 sds sdscatlen(sds s, void *t, size_t len) {
     struct sdshdr *sh;
     size_t curlen = sdslen(s);
@@ -124,9 +137,12 @@ sds sdscatlen(sds s, void *t, size_t len) {
     s = sdsMakeRoomFor(s,len);
     if (s == NULL) return NULL;
     sh = (void*) (s-(sizeof(struct sdshdr)));
+    // 拼接起来
     memcpy(s+curlen, t, len);
+    // 更新元信息
     sh->len = curlen+len;
     sh->free = sh->free-len;
+    // 重置结束符
     s[curlen+len] = '\0';
     return s;
 }
@@ -134,12 +150,13 @@ sds sdscatlen(sds s, void *t, size_t len) {
 sds sdscat(sds s, char *t) {
     return sdscatlen(s, t, strlen(t));
 }
-
+// 复制 t 到 s
 sds sdscpylen(sds s, char *t, size_t len) {
     struct sdshdr *sh = (void*) (s-(sizeof(struct sdshdr)));
     size_t totlen = sh->free+sh->len;
 
     if (totlen < len) {
+        // sdsMakeRoomFor 可能会发生双倍扩容
         s = sdsMakeRoomFor(s,len-sh->len);
         if (s == NULL) return NULL;
         sh = (void*) (s-(sizeof(struct sdshdr)));
@@ -148,6 +165,7 @@ sds sdscpylen(sds s, char *t, size_t len) {
     memcpy(s, t, len);
     s[len] = '\0';
     sh->len = len;
+    // 双倍扩容时，free 大于 0
     sh->free = totlen-len;
     return s;
 }
