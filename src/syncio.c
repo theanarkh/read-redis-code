@@ -46,6 +46,7 @@
  * done within 'timeout' milliseconds the operation succeeds and 'size' is
  * returned. Otherwise the operation fails, -1 is returned, and an unspecified
  * partial write could be performed against the file descriptor. */
+// 阻塞式写，支持 timeout
 ssize_t syncWrite(int fd, char *ptr, ssize_t size, long long timeout) {
     ssize_t nwritten, ret = size;
     long long start = mstime();
@@ -68,8 +69,10 @@ ssize_t syncWrite(int fd, char *ptr, ssize_t size, long long timeout) {
         if (size == 0) return ret;
 
         /* Wait */
+        // 等待可写，最久等待 wait 时间
         aeWait(fd,AE_WRITABLE,wait);
         elapsed = mstime() - start;
+        // 写超时
         if (elapsed >= timeout) {
             errno = ETIMEDOUT;
             return -1;

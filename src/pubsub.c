@@ -273,7 +273,7 @@ int pubsubPublishMessage(robj *channel, robj *message) {
 /*-----------------------------------------------------------------------------
  * Pubsub commands implementation
  *----------------------------------------------------------------------------*/
-
+// 客户端订阅多个 topic
 void subscribeCommand(redisClient *c) {
     int j;
 
@@ -281,19 +281,21 @@ void subscribeCommand(redisClient *c) {
         pubsubSubscribeChannel(c,c->argv[j]);
     c->flags |= REDIS_PUBSUB;
 }
-
+// 客户端取消订阅
 void unsubscribeCommand(redisClient *c) {
+    // 没有传具体 topic 则全部取消
     if (c->argc == 1) {
         pubsubUnsubscribeAllChannels(c,1);
     } else {
         int j;
-
+        // 否则只取消传的
         for (j = 1; j < c->argc; j++)
             pubsubUnsubscribeChannel(c,c->argv[j],1);
     }
+    // 如果全部取消了则清除 flag
     if (clientSubscriptionsCount(c) == 0) c->flags &= ~REDIS_PUBSUB;
 }
-
+// 发布多个 topic 消息
 void psubscribeCommand(redisClient *c) {
     int j;
 

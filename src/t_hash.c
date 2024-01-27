@@ -460,7 +460,7 @@ void hashTypeConvert(robj *o, int enc) {
 /*-----------------------------------------------------------------------------
  * Hash type commands
  *----------------------------------------------------------------------------*/
-
+// key 的值是一个哈希表，在哈希表中设置某个 key 的 value
 void hsetCommand(redisClient *c) {
     int update;
     robj *o;
@@ -475,11 +475,13 @@ void hsetCommand(redisClient *c) {
     server.dirty++;
 }
 
+// key 不存在的才设置新的 value
 void hsetnxCommand(redisClient *c) {
     robj *o;
+    // 获取 key 对应的哈希表
     if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1])) == NULL) return;
     hashTypeTryConversion(o,c->argv,2,3);
-
+    // 判断在该哈希表中，field 是否存在
     if (hashTypeExists(o, c->argv[2])) {
         addReply(c, shared.czero);
     } else {

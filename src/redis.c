@@ -1147,6 +1147,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
 
     /* Start a scheduled AOF rewrite if this was requested by the user while
      * a BGSAVE was in progress. */
+    // 因为 RDB 写导致的 AOF rewrite 延迟，在这里进行 rewrite
     if (server.rdb_child_pid == -1 && server.aof_child_pid == -1 &&
         server.aof_rewrite_scheduled)
     {
@@ -1154,19 +1155,21 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     }
 
     /* Check if a background saving or AOF rewrite in progress terminated. */
+    // 判断是否存在 RDB 或 AOF rewrite 进程，一次只处理一个进程
     if (server.rdb_child_pid != -1 || server.aof_child_pid != -1) {
         int statloc;
         pid_t pid;
-
+        // 判断它们是否执行结束（退出了）
         if ((pid = wait3(&statloc,WNOHANG,NULL)) != 0) {
+            // 获取退出码和信号（如果有的话）
             int exitcode = WEXITSTATUS(statloc);
             int bysignal = 0;
 
             if (WIFSIGNALED(statloc)) bysignal = WTERMSIG(statloc);
-
+            // RDB 进程结束了
             if (pid == server.rdb_child_pid) {
                 backgroundSaveDoneHandler(exitcode,bysignal);
-            } else if (pid == server.aof_child_pid) {
+            } else if (pid == server.aof_child_pid) { // AOF rewirte 进程结束了
                 backgroundRewriteDoneHandler(exitcode,bysignal);
             } else {
                 redisLog(REDIS_WARNING,
@@ -1178,6 +1181,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     } else {
         /* If there is not a background saving/rewrite in progress check if
          * we have to save/rewrite now */
+         // 根据配置判断是否需要进行写 RDB
          for (j = 0; j < server.saveparamslen; j++) {
             struct saveparam *sp = server.saveparams+j;
 
@@ -3531,6 +3535,7 @@ int checkForSentinelMode(int argc, char **argv) {
 /* Function called at startup to load RDB or AOF file in memory. */
 void loadDataFromDisk(void) {
     long long start = ustime();
+    // 开启了 AOF 则优先通过 AOF 文件恢复数据，否则通过 RDB 文件
     if (server.aof_state == REDIS_AOF_ON) {
         if (loadAppendOnlyFile(server.aof_filename) == REDIS_OK)
             redisLog(REDIS_NOTICE,"DB loaded from append only file: %.3f seconds",(float)(ustime()-start)/1000000);

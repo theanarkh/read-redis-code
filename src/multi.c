@@ -83,6 +83,7 @@ void flagTransaction(redisClient *c) {
         c->flags |= REDIS_DIRTY_EXEC;
 }
 
+// 执行 MULTI 命令，本质上是设置了 REDIS_MULTI flag
 void multiCommand(redisClient *c) {
     if (c->flags & REDIS_MULTI) {
         addReplyError(c,"MULTI calls can not be nested");
@@ -92,6 +93,7 @@ void multiCommand(redisClient *c) {
     addReply(c,shared.ok);
 }
 
+// 执行 DISCARD 命令，清除之前排队的命令，清除状态
 void discardCommand(redisClient *c) {
     if (!(c->flags & REDIS_MULTI)) {
         addReplyError(c,"DISCARD without MULTI");
@@ -129,6 +131,11 @@ void execCommand(redisClient *c) {
      * A failed EXEC in the first case returns a multi bulk nil object
      * (technically it is not an error but a special behavior), while
      * in the second an EXECABORT error is returned. */
+    /*
+        REDIS_DIRTY_CAS 说明 watch 的 key 发生了变化，
+        REDIS_DIRTY_EXEC 说明 MULTI 之后的无效的命令，
+        整个事务都需要被取消
+    */
     if (c->flags & (REDIS_DIRTY_CAS|REDIS_DIRTY_EXEC)) {
         addReply(c, c->flags & REDIS_DIRTY_EXEC ? shared.execaborterr :
                                                   shared.nullmultibulk);
@@ -258,12 +265,14 @@ void unwatchAllKeys(redisClient *c) {
 
 /* "Touch" a key, so that if this key is being WATCHed by some client the
  * next EXEC will fail. */
+// key 被修改，则通知 watch 这个 key 的客户端：先打个 flag
 void touchWatchedKey(redisDb *db, robj *key) {
     list *clients;
     listIter li;
     listNode *ln;
 
     if (dictSize(db->watched_keys) == 0) return;
+    // 获取 watch 这个 key 的客户端
     clients = dictFetchValue(db->watched_keys, key);
     if (!clients) return;
 

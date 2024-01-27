@@ -327,7 +327,7 @@ void lpushCommand(redisClient *c) {
 void rpushCommand(redisClient *c) {
     pushGenericCommand(c,REDIS_TAIL);
 }
-
+// key 存在的话才把 value push 到 list
 void pushxGenericCommand(redisClient *c, robj *refval, robj *val, int where) {
     robj *subject;
     listTypeIterator *iter;
@@ -409,6 +409,7 @@ void llenCommand(redisClient *c) {
     addReplyLongLong(c,listTypeLength(o));
 }
 
+// 返回 key 的 value 里，第 index 个元素
 void lindexCommand(redisClient *c) {
     robj *o = lookupKeyReadOrReply(c,c->argv[1],shared.nullbulk);
     if (o == NULL || checkType(c,o,REDIS_LIST)) return;
@@ -417,7 +418,7 @@ void lindexCommand(redisClient *c) {
 
     if ((getLongFromObjectOrReply(c, c->argv[2], &index, NULL) != REDIS_OK))
         return;
-
+    // 底层实现是 ziplist
     if (o->encoding == REDIS_ENCODING_ZIPLIST) {
         unsigned char *p;
         unsigned char *vstr;

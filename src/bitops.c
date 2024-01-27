@@ -239,6 +239,7 @@ void setbitCommand(redisClient *c) {
     }
 
     /* Grow sds value to the right length if necessary */
+    // 除以 8
     byte = bitoffset >> 3;
     o->ptr = sdsgrowzero(o->ptr,byte+1);
 

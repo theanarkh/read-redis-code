@@ -74,7 +74,7 @@ void setGenericCommand(redisClient *c, int flags, robj *key, robj *val, robj *ex
         }
         if (unit == UNIT_SECONDS) milliseconds *= 1000;
     }
-
+    // 设置了存在才写但是不存在或者设置了不存在才写但是已经存在的
     if ((flags & REDIS_SET_NX && lookupKeyWrite(c->db,key) != NULL) ||
         (flags & REDIS_SET_XX && lookupKeyWrite(c->db,key) == NULL))
     {
@@ -96,11 +96,11 @@ void setCommand(redisClient *c) {
     robj *expire = NULL;
     int unit = UNIT_SECONDS;
     int flags = REDIS_SET_NO_FLAGS;
-
+    // 处理 kv 后面的参数
     for (j = 3; j < c->argc; j++) {
         char *a = c->argv[j]->ptr;
         robj *next = (j == c->argc-1) ? NULL : c->argv[j+1];
-
+        // 根据值设置 flag
         if ((a[0] == 'n' || a[0] == 'N') &&
             (a[1] == 'x' || a[1] == 'X') && a[2] == '\0') {
             flags |= REDIS_SET_NX;
@@ -144,10 +144,10 @@ void psetexCommand(redisClient *c) {
 
 int getGenericCommand(redisClient *c) {
     robj *o;
-
+    // 获取 key 的 value，不存在则返回 null
     if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.nullbulk)) == NULL)
         return REDIS_OK;
-
+    // value 类型不是字符串则返回错误信息，否则返回 value
     if (o->type != REDIS_STRING) {
         addReply(c,shared.wrongtypeerr);
         return REDIS_ERR;
@@ -157,23 +157,30 @@ int getGenericCommand(redisClient *c) {
     }
 }
 
+// 获取 key 的 value
 void getCommand(redisClient *c) {
     getGenericCommand(c);
 }
 
+// 返回 key 当前的 value 给客户端，然后设置客户端设置的新 value
 void getsetCommand(redisClient *c) {
+    // 先返回当前的 value 给客户端
     if (getGenericCommand(c) == REDIS_ERR) return;
+    // 然后设置新的 value
     c->argv[2] = tryObjectEncoding(c->argv[2]);
     setKey(c->db,c->argv[1],c->argv[2]);
+    // 如果监听了这个 key 的事件则通知相关的客户端
     notifyKeyspaceEvent(REDIS_NOTIFY_STRING,"set",c->argv[1],c->db->id);
+    // set 产生了副作用，dirty 加一
     server.dirty++;
 }
 
+// SETRANGE key offset value，以旧 value 的 offset 字符为开始，用新的 value 替换
 void setrangeCommand(redisClient *c) {
     robj *o;
     long offset;
     sds value = c->argv[3]->ptr;
-
+    // 获取 offset 的值，值类型或者大小非法的话直接返回错误
     if (getLongFromObjectOrReply(c,c->argv[2],&offset,NULL) != REDIS_OK)
         return;
 
@@ -181,30 +188,36 @@ void setrangeCommand(redisClient *c) {
         addReplyError(c,"offset is out of range");
         return;
     }
-
+    // 获取旧的值
     o = lookupKeyWrite(c->db,c->argv[1]);
+    // key 不存在
     if (o == NULL) {
         /* Return 0 when setting nothing on a non-existing string */
+        // 新值为空字符串则返回 0，不把 key 写到 db 里
         if (sdslen(value) == 0) {
             addReply(c,shared.czero);
             return;
         }
 
         /* Return when the resulting string exceeds allowed size */
+        // 判断设置后的 value 长度是否超过阈值，是则直接返回错误
         if (checkStringLength(c,offset+sdslen(value)) != REDIS_OK)
             return;
-
+        // 写入 db，这时 value 是空字符串，下面的代码会重写 value
         o = createObject(REDIS_STRING,sdsempty());
         dbAdd(c->db,c->argv[1],o);
     } else {
         size_t olen;
 
         /* Key exists, check type */
+        // 类型不是字符串则直接返回错误
         if (checkType(c,o,REDIS_STRING))
             return;
 
         /* Return existing string length when setting nothing */
+        // 当前 value 的长度
         olen = stringObjectLen(o);
+        // 新 value 长度是 0，则直接返回
         if (sdslen(value) == 0) {
             addReplyLongLong(c,olen);
             return;
@@ -219,13 +232,16 @@ void setrangeCommand(redisClient *c) {
     }
 
     if (sdslen(value) > 0) {
+        // 修改值
         o->ptr = sdsgrowzero(o->ptr,offset+sdslen(value));
         memcpy((char*)o->ptr+offset,value,sdslen(value));
+        // 通知
         signalModifiedKey(c->db,c->argv[1]);
         notifyKeyspaceEvent(REDIS_NOTIFY_STRING,
             "setrange",c->argv[1],c->db->id);
         server.dirty++;
     }
+    // 回复
     addReplyLongLong(c,sdslen(o->ptr));
 }
 
@@ -265,7 +281,7 @@ void getrangeCommand(redisClient *c) {
         addReplyBulkCBuffer(c,(char*)str+start,end-start+1);
     }
 }
-
+// 获取多个 key 的 value
 void mgetCommand(redisClient *c) {
     int j;
 
@@ -283,7 +299,7 @@ void mgetCommand(redisClient *c) {
         }
     }
 }
-
+// 设置多个 key / value，设置了 nx 则在 key 不存在时才会设置
 void msetGenericCommand(redisClient *c, int nx) {
     int j, busykeys = 0;
 
@@ -299,12 +315,13 @@ void msetGenericCommand(redisClient *c, int nx) {
                 busykeys++;
             }
         }
+        // 所有 key 不存在才会修改，否则直接返回
         if (busykeys) {
             addReply(c, shared.czero);
             return;
         }
     }
-
+    // 设置每个 key 的 value，通知
     for (j = 1; j < c->argc; j += 2) {
         c->argv[j+1] = tryObjectEncoding(c->argv[j+1]);
         setKey(c->db,c->argv[j],c->argv[j+1]);
@@ -337,7 +354,7 @@ void incrDecrCommand(redisClient *c, long long incr) {
         return;
     }
     value += incr;
-
+    // 只有这个 key 持有这个 value 则直接修改，否则创建一个新的 value obj
     if (o && o->refcount == 1 && o->encoding == REDIS_ENCODING_INT &&
         (value < 0 || value >= REDIS_SHARED_INTEGERS) &&
         value >= LONG_MIN && value <= LONG_MAX)
@@ -346,6 +363,7 @@ void incrDecrCommand(redisClient *c, long long incr) {
         o->ptr = (void*)((long)value);
     } else {
         new = createStringObjectFromLongLong(value);
+        // 更新 db
         if (o) {
             dbOverwrite(c->db,c->argv[1],new);
         } else {
@@ -359,7 +377,7 @@ void incrDecrCommand(redisClient *c, long long incr) {
     addReply(c,new);
     addReply(c,shared.crlf);
 }
-
+// 加 1
 void incrCommand(redisClient *c) {
     incrDecrCommand(c,1);
 }
@@ -367,7 +385,7 @@ void incrCommand(redisClient *c) {
 void decrCommand(redisClient *c) {
     incrDecrCommand(c,-1);
 }
-
+// 加 n
 void incrbyCommand(redisClient *c) {
     long long incr;
 
@@ -416,6 +434,7 @@ void incrbyfloatCommand(redisClient *c) {
     rewriteClientCommandArgument(c,2,new);
 }
 
+// 存在则拼接，不存在则设置
 void appendCommand(redisClient *c) {
     size_t totlen;
     robj *o, *append;
@@ -449,6 +468,7 @@ void appendCommand(redisClient *c) {
     addReplyLongLong(c,totlen);
 }
 
+// value 的长度
 void strlenCommand(redisClient *c) {
     robj *o;
     if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.czero)) == NULL ||

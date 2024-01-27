@@ -635,6 +635,7 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val,
  * When the function returns REDIS_ERR and if 'error' is not NULL, the
  * integer pointed by 'error' is set to the value of errno just after the I/O
  * error. */
+// 把数据写到 RDB 文件
 int rdbSaveRio(rio *rdb, int *error) {
     dictIterator *di = NULL;
     dictEntry *de;
@@ -646,6 +647,7 @@ int rdbSaveRio(rio *rdb, int *error) {
     if (server.rdb_checksum)
         rdb->update_cksum = rioGenericUpdateChecksum;
     snprintf(magic,sizeof(magic),"REDIS%04d",REDIS_RDB_VERSION);
+    // 把 magic 写到 rio 的目的地，这里是一个文件
     if (rdbWriteRaw(rdb,magic,9) == -1) goto werr;
 
     for (j = 0; j < server.dbnum; j++) {
@@ -667,6 +669,7 @@ int rdbSaveRio(rio *rdb, int *error) {
 
             initStaticStringObject(key,keystr);
             expire = getExpire(db,&key);
+            // 写到文件里
             if (rdbSaveKeyValuePair(rdb,&key,o,expire,now) == -1) goto werr;
         }
         dictReleaseIterator(di);
@@ -729,20 +732,24 @@ int rdbSave(char *filename) {
             strerror(errno));
         return REDIS_ERR;
     }
-
+    // 初始化一个 rio，后续从 fp 进行读写
     rioInitWithFile(&rdb,fp);
+    // 同步内存数据到 RDB 文件
     if (rdbSaveRio(&rdb,&error) == REDIS_ERR) {
         errno = error;
         goto werr;
     }
 
     /* Make sure data will not remain on the OS's output buffers */
+    // fflush 是 C 库提供的函数，用于把 C 库的缓存数据写到操作系统缓冲区
     if (fflush(fp) == EOF) goto werr;
+    // fsync 是系统调用，用于把操作系统的缓存写到硬盘
     if (fsync(fileno(fp)) == -1) goto werr;
     if (fclose(fp) == EOF) goto werr;
 
     /* Use RENAME to make sure the DB file is changed atomically only
      * if the generate DB file is ok. */
+    // 写完后重命名
     if (rename(tmpfile,filename) == -1) {
         redisLog(REDIS_WARNING,"Error moving temp DB file on the final destination: %s", strerror(errno));
         unlink(tmpfile);
@@ -750,6 +757,7 @@ int rdbSave(char *filename) {
     }
     redisLog(REDIS_NOTICE,"DB saved on disk");
     server.dirty = 0;
+    // 更新快照的最后更新时间和状态
     server.lastsave = time(NULL);
     server.lastbgsave_status = REDIS_OK;
     return REDIS_OK;
@@ -761,22 +769,31 @@ werr:
     return REDIS_ERR;
 }
 
+/*
+    创建子进程把内存写入 RDB 文件
+    1. 根据配置文件自动 save
+    2. slave 发送命令 bgsave
+    3. 客户端发送命令 bgsave
+*/
 int rdbSaveBackground(char *filename) {
     pid_t childpid;
     long long start;
-
+    // 已经在处理了，直接返回
     if (server.rdb_child_pid != -1) return REDIS_ERR;
 
     server.dirty_before_bgsave = server.dirty;
     server.lastbgsave_try = time(NULL);
 
     start = ustime();
+    // 创建子进程进行数据的写入
     if ((childpid = fork()) == 0) {
         int retval;
 
         /* Child */
+        // 关闭继承过来的 fd
         closeListeningSockets(0);
         redisSetProcTitle("redis-rdb-bgsave");
+        // 写数据到文件
         retval = rdbSave(filename);
         if (retval == REDIS_OK) {
             size_t private_dirty = zmalloc_get_private_dirty();
@@ -787,9 +804,11 @@ int rdbSaveBackground(char *filename) {
                     private_dirty/(1024*1024));
             }
         }
+        // 退出
         exitFromChild((retval == REDIS_OK) ? 0 : 1);
     } else {
         /* Parent */
+        // 记录 fork 的时间，fork 时，子进程需要复制父进程的页表，如果父进程里的数据越多，则页表越大，复制的时间越长（页表是按需分配的）
         server.stat_fork_time = ustime()-start;
         server.stat_fork_rate = (double) zmalloc_used_memory() * 1000000 / server.stat_fork_time / (1024*1024*1024); /* GB per second. */
         latencyAddSampleIfNeeded("fork",server.stat_fork_time/1000);
@@ -800,6 +819,7 @@ int rdbSaveBackground(char *filename) {
             return REDIS_ERR;
         }
         redisLog(REDIS_NOTICE,"Background saving started by pid %d",childpid);
+        // 开始写入 RDB 文件的时间
         server.rdb_save_time_start = time(NULL);
         server.rdb_child_pid = childpid;
         server.rdb_child_type = REDIS_RDB_CHILD_TYPE_DISK;
@@ -1125,7 +1145,7 @@ void rdbLoadProgressCallback(rio *r, const void *buf, size_t len) {
         processEventsWhileBlocked();
     }
 }
-
+// 从 RDB 文件恢复数据到内存
 int rdbLoad(char *filename) {
     uint32_t dbid;
     int type, rdbver;
@@ -1136,7 +1156,7 @@ int rdbLoad(char *filename) {
     rio rdb;
 
     if ((fp = fopen(filename,"r")) == NULL) return REDIS_ERR;
-
+    // 初始化 rio，后续从文件 fp 中读写
     rioInitWithFile(&rdb,fp);
     rdb.update_cksum = rdbLoadProgressCallback;
     rdb.max_processing_chunk = server.loading_process_events_interval_bytes;
@@ -1241,16 +1261,18 @@ eoferr: /* unexpected end of file is handled here with a fatal exit */
 /* A background saving child (BGSAVE) terminated its work. Handle this.
  * This function covers the case of actual BGSAVEs. */
 void backgroundSaveDoneHandlerDisk(int exitcode, int bysignal) {
+    // 子进程不是因为信号退出且退出码为 0 说明写成功
     if (!bysignal && exitcode == 0) {
         redisLog(REDIS_NOTICE,
             "Background saving terminated with success");
+        // 更新 dirty = 当前的 - 写 RDB 之前的，server.dirty_before_bgsave 在写 RDB 前设置
         server.dirty = server.dirty - server.dirty_before_bgsave;
         server.lastsave = time(NULL);
         server.lastbgsave_status = REDIS_OK;
-    } else if (!bysignal && exitcode != 0) {
+    } else if (!bysignal && exitcode != 0) { // 子进程内发生了错误
         redisLog(REDIS_WARNING, "Background saving error");
         server.lastbgsave_status = REDIS_ERR;
-    } else {
+    } else { // 因为信号导致的退出
         mstime_t latency;
 
         redisLog(REDIS_WARNING,
@@ -1261,11 +1283,13 @@ void backgroundSaveDoneHandlerDisk(int exitcode, int bysignal) {
         latencyAddSampleIfNeeded("rdb-unlink-temp-file",latency);
         /* SIGUSR1 is whitelisted, so we have a way to kill a child without
          * tirggering an error conditon. */
+        // SIGUSR1 为 redis 内部发送的信号，否则说明出错
         if (bysignal != SIGUSR1)
             server.lastbgsave_status = REDIS_ERR;
     }
     server.rdb_child_pid = -1;
     server.rdb_child_type = REDIS_RDB_CHILD_TYPE_NONE;
+    // 写入所花费的时间
     server.rdb_save_time_last = time(NULL)-server.rdb_save_time_start;
     server.rdb_save_time_start = -1;
     /* Possibly there are slaves waiting for a BGSAVE in order to be served
@@ -1369,6 +1393,7 @@ void backgroundSaveDoneHandlerSocket(int exitcode, int bysignal) {
 }
 
 /* When a background RDB saving/transfer terminates, call the right handler. */
+// 写 RDB 结束后执行
 void backgroundSaveDoneHandler(int exitcode, int bysignal) {
     switch(server.rdb_child_type) {
     case REDIS_RDB_CHILD_TYPE_DISK:
@@ -1521,6 +1546,7 @@ int rdbSaveToSlavesSockets(void) {
     return REDIS_OK; /* unreached */
 }
 
+// SAVE 命令，会阻塞进程
 void saveCommand(redisClient *c) {
     if (server.rdb_child_pid != -1) {
         addReplyError(c,"Background save already in progress");
@@ -1533,6 +1559,7 @@ void saveCommand(redisClient *c) {
     }
 }
 
+// bgsave，不会阻塞子进程
 void bgsaveCommand(redisClient *c) {
     if (server.rdb_child_pid != -1) {
         addReplyError(c,"Background save already in progress");
