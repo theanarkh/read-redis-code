@@ -1478,6 +1478,7 @@ static void initServerConfig() {
     server.dbnum = REDIS_DEFAULT_DBNUM;
     server.port = REDIS_SERVERPORT;
     server.verbosity = REDIS_VERBOSE;
+    // 客户端连接最大空闲时间
     server.maxidletime = REDIS_MAXIDLETIME;
     server.saveparams = NULL;
     server.logfile = NULL; /* NULL = log on standard output */
@@ -1552,7 +1553,7 @@ static void initServer() {
     createSharedObjects();
     // 创建事件循环
     server.el = aeCreateEventLoop();
-    // 创建 db，客户端通信前可以选择 db，后续基于该 bd 进行操作
+    // 创建 db，客户端通信前可以选择 db，后续基于该 db 进行操作
     server.db = zmalloc(sizeof(redisDb)*server.dbnum);
     server.sharingpool = dictCreate(&setDictType,NULL);
     // 创建 redis 服务器，记录 fd
@@ -2067,12 +2068,13 @@ static void call(redisClient *c, struct redisCommand *cmd) {
     // server.dirty-dirty 非 0 说明该命令的操作需要记录到文件中，比如 get 命令不需要
     if (server.appendonly && server.dirty-dirty)
         feedAppendOnlyFile(cmd,c->db->id,c->argv,c->argc);
-    // 同步到 slve
+    // 同步到 slave
     if (server.dirty-dirty && listLength(server.slaves))
         replicationFeedSlaves(server.slaves,cmd,c->db->id,c->argv,c->argc);
     // 同步给 monitor 客户端
     if (listLength(server.monitors))
         replicationFeedSlaves(server.monitors,cmd,c->db->id,c->argv,c->argc);
+    // 处理的命令数加一
     server.stat_numcommands++;
 }
 
@@ -2088,6 +2090,7 @@ static int processCommand(redisClient *c) {
     struct redisCommand *cmd;
 
     /* Free some memory if needed (maxmemory setting) */
+    // 如果设置了最大内存则尝试释放内存
     if (server.maxmemory) freeMemoryIfNeeded();
 
     /* Handle the multi bulk command type. This is an alternative protocol
@@ -2160,6 +2163,7 @@ static int processCommand(redisClient *c) {
 
     /* The QUIT command is handled as a special case. Normal command
      * procs are unable to close the client connection safely */
+    // 退出命令
     if (!strcasecmp(c->argv[0]->ptr,"quit")) {
         freeClient(c);
         return 0;
@@ -2184,12 +2188,15 @@ static int processCommand(redisClient *c) {
                 cmd->name));
         resetClient(c);
         return 1;
+    // 该命令需要消耗内存，但是当前内存已经超过配置的阈值，则报错
     } else if (server.maxmemory && cmd->flags & REDIS_CMD_DENYOOM && zmalloc_used_memory() > server.maxmemory) {
         addReplySds(c,sdsnew("-ERR command not allowed when used memory > 'maxmemory'\r\n"));
         resetClient(c);
         return 1;
+    // 是批量写命令
     } else if (cmd->flags & REDIS_CMD_BULK && c->bulklen == -1) {
         /* This is a bulk command, we have to read the last argument yet. */
+        // 从最后一个参数读取字节数
         int bulklen = atoi(c->argv[c->argc-1]->ptr);
 
         decrRefCount(c->argv[c->argc-1]);
@@ -2199,6 +2206,7 @@ static int processCommand(redisClient *c) {
             resetClient(c);
             return 1;
         }
+        // 消费完，去掉最后一个参数
         c->argc--;
         c->bulklen = bulklen+2; /* add two bytes for CR+LF */
         /* It is possible that the bulk read is already in the
@@ -2206,9 +2214,12 @@ static int processCommand(redisClient *c) {
          * This is just a fast path, alternative to call processInputBuffer().
          * It's a good idea since the code is small and this condition
          * happens most of the times. */
+        // 已经收到了足够的数据
         if ((signed)sdslen(c->querybuf) >= c->bulklen) {
+            // 把收到的数据写入参数中
             c->argv[c->argc] = createStringObject(c->querybuf,c->bulklen-2);
             c->argc++;
+            // 更新 querybuf 的内容
             c->querybuf = sdsrange(c->querybuf,c->bulklen,-1);
         } else {
             /* Otherwise return... there is to read the last argument
@@ -2223,6 +2234,7 @@ static int processCommand(redisClient *c) {
             c->argv[j] = tryObjectSharing(c->argv[j]);
     }
     /* Let's try to encode the bulk object to save space. */
+    // 如果是 REDIS_CMD_BULK 命令，则最后一个参数是数据的内容，尝试把字符串转成整数节省空间
     if (cmd->flags & REDIS_CMD_BULK)
         tryObjectEncoding(c->argv[c->argc-1]);
 
@@ -2235,6 +2247,7 @@ static int processCommand(redisClient *c) {
     }
 
     /* Exec the command */
+    // 如果当前客户端处于执行多个命令状态，并且当前不是执行或放弃执行命令，则当前命令先排队等待执行
     if (c->flags & REDIS_MULTI && cmd->proc != execCommand && cmd->proc != discardCommand) {
         queueMultiCommand(c,cmd);
         addReply(c,shared.queued);
@@ -2332,17 +2345,17 @@ again:
     // 初始化时为 -1
     if (c->bulklen == -1) {
         /* Read the first line of the query */
-        // 找到 \n 按行处理
+        // 找到 \n 的位置，按行处理
         char *p = strchr(c->querybuf,'\n');
         size_t querylen;
 
         if (p) {
             sds query, *argv;
             int argc, j;
-            
+            // query 最终指向当前行的数据
             query = c->querybuf;
             c->querybuf = sdsempty();
-            // 当前待处理数据的长度
+            // 当前待处理行的数据长度
             querylen = 1+(p-(query));
             // \n 后还有多余的数据，即下一条命令，保存到 buf 里
             if (sdslen(query) > querylen) {
@@ -2351,18 +2364,19 @@ again:
             }
             // 修改 \n 为 \0 sdsupdatelen 才能正确统计命令的长度
             *p = '\0'; /* remove "\n" */
+            // 如果 \n 前是 \r 则把 \r 也置为 \0，如 get key\r\n
             if (*(p-1) == '\r') *(p-1) = '\0'; /* and "\r" if any */
             // 更新 query 的长度，为该条命令的字符串长度
             sdsupdatelen(query);
 
             /* Now we can split the query in arguments */
-            // 以一个空格为分隔符切分命令为多个项，argc 为数量
+            // 以一个空格为分隔符切分命令为多个项，argc 为数量，argv 为 sds 指针，指向 sds 数组，元素为参数的内容，如 set key value
             argv = sdssplitlen(query,sdslen(query)," ",1,&argc);
             // 释放 query 的内存
             sdsfree(query);
             // 释放处理上一条命令时分配的内存
             if (c->argv) zfree(c->argv);
-            // 继续处理命令
+            // 分配内存保存命令参数，每个元素以 robj 结构体保存
             c->argv = zmalloc(sizeof(robj*)*argc);
             // 把 string 转成 robj
             for (j = 0; j < argc; j++) {
@@ -2374,7 +2388,14 @@ again:
                     sdsfree(argv[j]);
                 }
             }
-            // 转成 robj 后释放 argv
+            // 转成 robj 后释放 argv，因为 argv 指向了一个指针数组，指针数组中的每个元素已经被 c->argv 指向的 robj 对象持有
+            /* 
+            argv ->   |robj * |robj * | ...
+                        ↓
+                       robj地址
+                        ↑
+            c->argv ->|robj * |robj * | ...     
+            */
             zfree(argv);
             if (c->argc) {
                 /* Execute the command. If the client is still valid
@@ -2483,6 +2504,7 @@ static redisClient *createClient(int fd) {
     c->flags = 0;
     // 最后交互的时间，每次收到数据时需要更新
     c->lastinteraction = time(NULL);
+    // 是否需要身份验证
     c->authenticated = 0;
     c->replstate = REDIS_REPL_NONE;
     c->reply = listCreate();
@@ -2505,6 +2527,7 @@ static redisClient *createClient(int fd) {
 }
 
 static void addReply(redisClient *c, robj *obj) {
+    // 注册等待写事件
     if (listLength(c->reply) == 0 &&
         (c->replstate == REDIS_REPL_NONE ||
          c->replstate == REDIS_REPL_ONLINE) &&
@@ -2515,6 +2538,7 @@ static void addReply(redisClient *c, robj *obj) {
         obj = dupStringObject(obj);
         obj->refcount = 0; /* getDecodedObject() will increment the refcount */
     }
+    // 加入响应队列
     listAddNodeTail(c->reply,getDecodedObject(obj));
 }
 
@@ -2580,12 +2604,16 @@ static void addReplyBulkLen(redisClient *c, robj *obj) {
             len++;
         }
     }
+    // $ 开头表示数字
     addReplySds(c,sdscatprintf(sdsempty(),"$%lu\r\n",(unsigned long)len));
 }
 
 static void addReplyBulk(redisClient *c, robj *obj) {
+    // 数据长度
     addReplyBulkLen(c,obj);
+    // 数据内容
     addReply(c,obj);
+    // 结束符
     addReply(c,shared.crlf);
 }
 
@@ -2820,6 +2848,7 @@ static robj *lookupKey(redisDb *db, robj *key) {
 }
 // 查找 key，如果过期则返回 NULL
 static robj *lookupKeyRead(redisDb *db, robj *key) {
+    // 先判断该 key 释放过期了，是的话先删除
     expireIfNeeded(db,key);
     return lookupKey(db,key);
 }
@@ -2830,8 +2859,9 @@ static robj *lookupKeyWrite(redisDb *db, robj *key) {
 }
 
 static robj *lookupKeyReadOrReply(redisClient *c, robj *key, robj *reply) {
-    // 值时 robj 结构体
+    // 值是 robj 结构体
     robj *o = lookupKeyRead(c->db, key);
+    // 找不到则返回 reply 的内容
     if (!o) addReply(c,reply);
     return o;
 }
@@ -3418,6 +3448,7 @@ static int rdbSaveBackground(char *filename) {
             return REDIS_ERR;
         }
         redisLog(REDIS_NOTICE,"Background saving started by pid %d",childpid);
+        // 记录子进程 id，避免多次执行 rdb 备份
         server.bgsavechildpid = childpid;
         return REDIS_OK;
     }
@@ -3747,6 +3778,7 @@ eoferr: /* unexpected end of file is handled here with a fatal exit */
 /*================================== Commands =============================== */
 
 static void authCommand(redisClient *c) {
+    // 不需要验证或者验证通过则设置 authenticated 为 1 并回复 ok 给客户端
     if (!server.requirepass || !strcmp(c->argv[1]->ptr, server.requirepass)) {
       c->authenticated = 1;
       addReply(c,shared.ok);
@@ -3773,7 +3805,10 @@ static void setGenericCommand(redisClient *c, int nx) {
     // 插入 dict 中
     retval = dictAdd(c->db->dict,c->argv[1],c->argv[2]);
     if (retval == DICT_ERR) {
+        // key 已经存在
+        // 如果设置 nx 说明不存在才写入
         if (!nx) {
+            // key 已经存在则覆盖
             /* If the key is about a swapped value, we want a new key object
              * to overwrite the old. So we delete the old key in the database.
              * This will also make sure that swap pages about the old object
@@ -3783,6 +3818,7 @@ static void setGenericCommand(redisClient *c, int nx) {
             dictReplace(c->db->dict,c->argv[1],c->argv[2]);
             incrRefCount(c->argv[2]);
         } else {
+            // 设置了 nx 但是 key 已经存在则返回没有设置成功
             addReply(c,shared.czero);
             return;
         }
@@ -3792,22 +3828,24 @@ static void setGenericCommand(redisClient *c, int nx) {
     }
     // 设置需要同步到 slave 或 monitor
     server.dirty++;
-    // 从过期 dict 中删除，如果相关的话
+    // 从过期 dict 中删除，如果存在的话
     removeExpire(c->db,c->argv[1]);
     addReply(c, nx ? shared.cone : shared.ok);
 }
 // set key value
 static void setCommand(redisClient *c) {
-    setGenericCommand(c,0);
+    // 该 key 不会过期
+    setGenericCommand(c,0); 
 }
 
 static void setnxCommand(redisClient *c) {
+    // 不存在才写入
     setGenericCommand(c,1);
 }
 
 static int getGenericCommand(redisClient *c) {
     robj *o;
-    
+    // c->argv[1] 为 key，不存在（o=NULL）则返回 shared.nullbulk 的内容
     if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.nullbulk)) == NULL)
         return REDIS_OK;
 
@@ -3815,6 +3853,7 @@ static int getGenericCommand(redisClient *c) {
         addReply(c,shared.wrongtypeerr);
         return REDIS_ERR;
     } else {
+        // 存在则返回存在的值
         addReplyBulk(c,o);
         return REDIS_OK;
     }
@@ -3838,8 +3877,14 @@ static void getsetCommand(redisClient *c) {
 
 static void mgetCommand(redisClient *c) {
     int j;
-  
+    /**
+     * *数组长度
+     * $字符串长度字符串值
+     * $字符串长度字符串值
+     */
+    // 返回多个值，* 开头表示数组长度
     addReplySds(c,sdscatprintf(sdsempty(),"*%d\r\n",c->argc-1));
+    // 返回每个元素
     for (j = 1; j < c->argc; j++) {
         robj *o = lookupKeyRead(c->db,c->argv[j]);
         if (o == NULL) {
@@ -3856,39 +3901,47 @@ static void mgetCommand(redisClient *c) {
 
 static void msetGenericCommand(redisClient *c, int nx) {
     int j, busykeys = 0;
-
+    // set k1 v1 k2 v2 命令+参数的个数需要是奇数
     if ((c->argc % 2) == 0) {
         addReplySds(c,sdsnew("-ERR wrong number of arguments for MSET\r\n"));
         return;
     }
     /* Handle the NX flag. The MSETNX semantic is to return zero and don't
      * set nothing at all if at least one already key exists. */
+    // 设置了不存在才写入
     if (nx) {
+        // 遍历 key
         for (j = 1; j < c->argc; j += 2) {
+            // 如果 key 存在则记录
             if (lookupKeyWrite(c->db,c->argv[j]) != NULL) {
                 busykeys++;
             }
         }
     }
+    // 至少一个 key 存在，则整体写入失败
     if (busykeys) {
         addReply(c, shared.czero);
         return;
     }
-
+    // 逐个 key 写入
     for (j = 1; j < c->argc; j += 2) {
         int retval;
 
         tryObjectEncoding(c->argv[j+1]);
+        // 写入字典
         retval = dictAdd(c->db->dict,c->argv[j],c->argv[j+1]);
         if (retval == DICT_ERR) {
+            // 如果已经存在则覆盖写
             dictReplace(c->db->dict,c->argv[j],c->argv[j+1]);
             incrRefCount(c->argv[j+1]);
         } else {
             incrRefCount(c->argv[j]);
             incrRefCount(c->argv[j+1]);
         }
+        // 如果该 key 之前在过期字典中，则删除，相当于刷新了过期时间
         removeExpire(c->db,c->argv[j]);
     }
+    // 更新 server.dirty 为 key 的个数，-1 是因为需要减去第一个命令 set
     server.dirty += (c->argc-1)/2;
     addReply(c, nx ? shared.cone : shared.ok);
 }
@@ -3907,6 +3960,7 @@ static void incrDecrCommand(redisClient *c, long long incr) {
     robj *o;
     
     o = lookupKeyWrite(c->db,c->argv[1]);
+    // key 不存在则初始化为 0
     if (o == NULL) {
         value = 0;
     } else {
@@ -3923,10 +3977,11 @@ static void incrDecrCommand(redisClient *c, long long incr) {
                 redisAssert(1 != 1);
         }
     }
-
+    // 更新值+1
     value += incr;
     o = createObject(REDIS_STRING,sdscatprintf(sdsempty(),"%lld",value));
     tryObjectEncoding(o);
+    // 写入新值，如果存在则覆盖写
     retval = dictAdd(c->db->dict,c->argv[1],o);
     if (retval == DICT_ERR) {
         dictReplace(c->db->dict,c->argv[1],o);
@@ -3934,6 +3989,7 @@ static void incrDecrCommand(redisClient *c, long long incr) {
     } else {
         incrRefCount(c->argv[1]);
     }
+    // 更新 key + 1
     server.dirty++;
     addReply(c,shared.colon);
     addReply(c,o);
@@ -4056,12 +4112,13 @@ static void delCommand(redisClient *c) {
 }
 
 static void existsCommand(redisClient *c) {
+    // 判断 key 释放存在
     addReply(c,lookupKeyRead(c->db,c->argv[1]) ? shared.cone : shared.czero);
 }
 
 static void selectCommand(redisClient *c) {
     int id = atoi(c->argv[1]->ptr);
-    
+    // 选择 db，后续操作基于选择的 db
     if (selectDb(c,id) == REDIS_ERR) {
         addReplySds(c,sdsnew("-ERR invalid DB index\r\n"));
     } else {
@@ -4071,9 +4128,10 @@ static void selectCommand(redisClient *c) {
 
 static void randomkeyCommand(redisClient *c) {
     dictEntry *de;
-   
+    // 选择随机 key
     while(1) {
         de = dictGetRandomKey(c->db->dict);
+        // 字典里没有元素或者key没过期
         if (!de || expireIfNeeded(c->db,dictGetEntryKey(de)) == 0) break;
     }
     if (de == NULL) {
@@ -4126,7 +4184,7 @@ static void lastsaveCommand(redisClient *c) {
 static void typeCommand(redisClient *c) {
     robj *o;
     char *type;
-
+    // 获取 key 的类型 type key
     o = lookupKeyRead(c->db,c->argv[1]);
     if (o == NULL) {
         type = "+none";
@@ -4145,10 +4203,13 @@ static void typeCommand(redisClient *c) {
 }
 
 static void saveCommand(redisClient *c) {
+    // 执行 rdb 备份
+    // 正在异步执行 rdb 备份则报错
     if (server.bgsavechildpid != -1) {
         addReplySds(c,sdsnew("-ERR background save in progress\r\n"));
         return;
     }
+    // 同步执行备份
     if (rdbSave(server.dbfilename) == REDIS_OK) {
         addReply(c,shared.ok);
     } else {
@@ -4161,6 +4222,7 @@ static void bgsaveCommand(redisClient *c) {
         addReplySds(c,sdsnew("-ERR background save already in progress\r\n"));
         return;
     }
+    // 异步 rdb 备份
     if (rdbSaveBackground(server.dbfilename) == REDIS_OK) {
         char *status = "+Background saving started\r\n";
         addReplySds(c,sdsnew(status));
@@ -4605,6 +4667,7 @@ static void saddCommand(redisClient *c) {
     robj *set;
 
     set = lookupKeyWrite(c->db,c->argv[1]);
+    // key 不存在则初始化 key 的值为空的 set
     if (set == NULL) {
         set = createSetObject();
         dictAdd(c->db->dict,c->argv[1],set);
@@ -4615,6 +4678,7 @@ static void saddCommand(redisClient *c) {
             return;
         }
     }
+    // 把 value 写入 set
     if (dictAdd(set->ptr,c->argv[2],NULL) == DICT_OK) {
         incrRefCount(c->argv[2]);
         server.dirty++;
@@ -4626,10 +4690,10 @@ static void saddCommand(redisClient *c) {
 
 static void sremCommand(redisClient *c) {
     robj *set;
-
+    // 从 set 中删除元素，不存在则返回 shared.czero
     if ((set = lookupKeyWriteOrReply(c,c->argv[1],shared.czero)) == NULL ||
         checkType(c,set,REDIS_SET)) return;
-
+    // 从 set 中删除 c->argv[2] 对应的 key srem key value
     if (dictDelete(set->ptr,c->argv[2]) == DICT_OK) {
         server.dirty++;
         if (htNeedsResize(set->ptr)) dictResize(set->ptr);
@@ -6662,6 +6726,7 @@ static int removeExpire(redisDb *db, robj *key) {
 }
 
 static int setExpire(redisDb *db, robj *key, time_t when) {
+    // 如果已经存在则不能设置了
     if (dictAdd(db->expires,key,(void*)when) == DICT_ERR) {
         return 0;
     } else {
@@ -6687,13 +6752,16 @@ static int expireIfNeeded(redisDb *db, robj *key) {
     dictEntry *de;
 
     /* No expire? return ASAP */
+    // 过期字典为空或者该 key 不在过期字典中则返回
     if (dictSize(db->expires) == 0 ||
        (de = dictFind(db->expires,key)) == NULL) return 0;
 
     /* Lookup the expire */
+    // 过期字典的值是过期时间
     when = (time_t) dictGetEntryVal(de);
+    // 还没过期则返回
     if (time(NULL) <= when) return 0;
-
+    // 否则删除该 key
     /* Delete the key */
     dictDelete(db->expires,key);
     return dictDelete(db->dict,key) == DICT_OK;
@@ -6721,11 +6789,14 @@ static void expireGenericCommand(redisClient *c, robj *key, time_t seconds) {
         return;
     }
     if (seconds < 0) {
+        // 时间为负数则删除 key
         if (deleteKey(c->db,key)) server.dirty++;
         addReply(c, shared.cone);
         return;
     } else {
+        // 否则设置过期时间为绝对时间
         time_t when = time(NULL)+seconds;
+        // 写入过期字典中，redis 会定时扫过期字典
         if (setExpire(c->db,key,when)) {
             addReply(c,shared.cone);
             server.dirty++;
@@ -6737,6 +6808,7 @@ static void expireGenericCommand(redisClient *c, robj *key, time_t seconds) {
 }
 
 static void expireCommand(redisClient *c) {
+    // 设置 key 的过期时间，该版本不支持在 set 命令中设置
     expireGenericCommand(c,c->argv[1],strtol(c->argv[2]->ptr,NULL,10));
 }
 
@@ -6747,7 +6819,7 @@ static void expireatCommand(redisClient *c) {
 static void ttlCommand(redisClient *c) {
     time_t expire;
     int ttl = -1;
-
+    // 获取还有多久过期
     expire = getExpire(c->db,c->argv[1]);
     if (expire != -1) {
         ttl = (int) (expire-time(NULL));
@@ -6797,6 +6869,7 @@ static void queueMultiCommand(redisClient *c, struct redisCommand *cmd) {
 }
 
 static void multiCommand(redisClient *c) {
+    // 设置进入执行多命令状态
     c->flags |= REDIS_MULTI;
     addReply(c,shared.ok);
 }
@@ -6806,7 +6879,7 @@ static void discardCommand(redisClient *c) {
         addReplySds(c,sdsnew("-ERR DISCARD without MULTI\r\n"));
         return;
     }
-
+    // 退出执行多命令状态
     freeClientMultiState(c);
     initClientMultiState(c);
     c->flags &= (~REDIS_MULTI);
@@ -6814,27 +6887,32 @@ static void discardCommand(redisClient *c) {
 }
 
 static void execCommand(redisClient *c) {
+    // 执行前面发送的多个命令
     int j;
     robj **orig_argv;
     int orig_argc;
-
+    // 需要判断当前是否处于执行多命令的状态
     if (!(c->flags & REDIS_MULTI)) {
         addReplySds(c,sdsnew("-ERR EXEC without MULTI\r\n"));
         return;
     }
-
+    // 保存当前命令信息
     orig_argv = c->argv;
     orig_argc = c->argc;
+    // 返回执行的命令个数
     addReplySds(c,sdscatprintf(sdsempty(),"*%d\r\n",c->mstate.count));
+    // 逐个执行命令
     for (j = 0; j < c->mstate.count; j++) {
         c->argc = c->mstate.commands[j].argc;
         c->argv = c->mstate.commands[j].argv;
         call(c,c->mstate.commands[j].cmd);
     }
+    // 恢复执行前的命令信息
     c->argv = orig_argv;
     c->argc = orig_argc;
     freeClientMultiState(c);
     initClientMultiState(c);
+    // 清除状态
     c->flags &= (~REDIS_MULTI);
 }
 
@@ -7432,17 +7510,20 @@ static void freeMemoryIfNeeded(void) {
     // 设置了内存阈值并且当前分配的内存达到了阈值，则看有没有可释放的内存
     while (server.maxmemory && zmalloc_used_memory() > server.maxmemory) {
         int j, k, freed = 0;
-
+        // 释放空闲对象链表里的内存
         if (tryFreeOneObjectFromFreelist() == REDIS_OK) continue;
+        // 删除 db 中过期的数据
         for (j = 0; j < server.dbnum; j++) {
             int minttl = -1;
             robj *minkey = NULL;
             struct dictEntry *de;
             // 主动删除过期的元素，一般是访问该 key 时才懒删除
             if (dictSize(server.db[j].expires)) {
+                // 标记从过期元素中删除了元素，即释放了内存
                 freed = 1;
                 /* From a sample of three keys drop the one nearest to
                  * the natural expire */
+                // 随机选择几个元素，找到最快到期的
                 for (k = 0; k < 3; k++) {
                     time_t t;
 
@@ -7453,9 +7534,12 @@ static void freeMemoryIfNeeded(void) {
                         minttl = t;
                     }
                 }
+                // 删除它
                 deleteKey(server.db+j,minkey);
             }
         }
+        // 为 0 说明没有可删除元素，即没有内存可以释放，直接返回，
+        // 如果有删除的元素则继续判断是否得到了内存的要求，否则继续删除
         if (!freed) return; /* nothing to free... */
     }
 }
