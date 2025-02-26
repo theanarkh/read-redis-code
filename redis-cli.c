@@ -186,23 +186,26 @@ static int cliConnect(void) {
     return fd;
 }
 
+// 从 fd 读取一行数据
 static sds cliReadLine(int fd) {
     sds line = sdsempty();
 
     while(1) {
         char c;
         ssize_t ret;
-
+        // 一个个读，因为需要判断是否读到 \n 了
         ret = read(fd,&c,1);
         if (ret == -1) {
             sdsfree(line);
             return NULL;
-        } else if ((ret == 0) || (c == '\n')) {
+        } else if ((ret == 0) || (c == '\n')) { // 读完或者读到 \n 则说明读完了
             break;
         } else {
+            // 拼接起来
             line = sdscatlen(line,&c,1);
         }
     }
+    // 返回一行数据，去掉 "\r\n"
     return sdstrim(line,"\r\n");
 }
 
@@ -210,6 +213,7 @@ static int cliReadSingleLineReply(int fd, int quiet) {
     sds reply = cliReadLine(fd);
 
     if (reply == NULL) return 1;
+    // quiet=1 说明吞掉消息不打印，= 0 说明打印
     if (!quiet)
         printf("%s\n", reply);
     sdsfree(reply);
@@ -217,6 +221,7 @@ static int cliReadSingleLineReply(int fd, int quiet) {
 }
 
 static int cliReadBulkReply(int fd) {
+    // 读取响应数据长度
     sds replylen = cliReadLine(fd);
     char *reply, crlf[2];
     int bulklen;
@@ -228,9 +233,12 @@ static int cliReadBulkReply(int fd) {
         printf("(nil)\n");
         return 0;
     }
+    // 分配内存读取响应
     reply = zmalloc(bulklen);
+    // 读取响应数据
     anetRead(fd,reply,bulklen);
     anetRead(fd,crlf,2);
+    // 打印 reply 到标准输出
     if (bulklen && fwrite(reply,bulklen,1,stdout) == 0) {
         zfree(reply);
         return 1;
@@ -242,6 +250,7 @@ static int cliReadBulkReply(int fd) {
 }
 
 static int cliReadMultiBulkReply(int fd) {
+    // 数组长度
     sds replylen = cliReadLine(fd);
     int elements, c = 1;
 
@@ -256,7 +265,9 @@ static int cliReadMultiBulkReply(int fd) {
         printf("(empty list or set)\n");
     }
     while(elements--) {
+        // 输出元素索引
         printf("%d. ", c);
+        // 按行读取，一行代表一个元素
         if (cliReadReply(fd)) return 1;
         c++;
     }
@@ -265,11 +276,14 @@ static int cliReadMultiBulkReply(int fd) {
 
 static int cliReadReply(int fd) {
     char type;
-
+    // 读第一个字符
     if (anetRead(fd,&type,1) <= 0) exit(1);
+    // 根据响应数据的类型进行下一步读取
     switch(type) {
     case '-':
+        // 打印错误提示
         printf("(error) ");
+        // 读取打印错误信息
         cliReadSingleLineReply(fd,0);
         return 1;
     case '+':
@@ -280,6 +294,7 @@ static int cliReadReply(int fd) {
     case '$':
         return cliReadBulkReply(fd);
     case '*':
+        // 数组
         return cliReadMultiBulkReply(fd);
     default:
         printf("protocol error, got '%c' as reply type byte\n", type);
@@ -296,10 +311,13 @@ static int selectDb(int fd) {
         return 0;
 
     cmd = sdsempty();
+    // 发送 select 命令选择 db
     cmd = sdscatprintf(cmd,"SELECT %d\r\n",config.dbnum);
     anetWrite(fd,cmd,sdslen(cmd));
     anetRead(fd,&type,1);
+    // 返回不符合预期
     if (type <= 0 || type != '+') return 1;
+    // 读取响应
     retval = cliReadSingleLineReply(fd,1);
     if (retval) {
         return retval;
@@ -323,6 +341,7 @@ static int cliSendCommand(int argc, char **argv) {
             fprintf(stderr,"Wrong number of arguments for '%s'\n",rc->name);
             return 1;
     }
+    // 是 monitor 命令，则一直读取服务器的返回
     if (!strcasecmp(rc->name,"monitor")) read_forever = 1;
     if ((fd = cliConnect()) == -1) return 1;
 
@@ -336,7 +355,16 @@ static int cliSendCommand(int argc, char **argv) {
     while(config.repeat--) {
         /* Build the command to send */
         cmd = sdsempty();
+        // 批量读写命令，如 mset x y a b
         if (rc->flags & REDIS_CMD_MULTIBULK) {
+            /**
+             * 格式：
+             *  *命令+参数个数\r\n   => *5\r\n
+             *  $命令字符串长度\r\n  => $4\r\n
+             *  命令字符串\r\n      => mset
+             *  $命令字符串长度\r\n => $1\r\n
+             *  命令字符串\r\n      => x\r\n
+             */
             cmd = sdscatprintf(cmd,"*%d\r\n",argc);
             for (j = 0; j < argc; j++) {
                 cmd = sdscatprintf(cmd,"$%lu\r\n",
@@ -345,8 +373,10 @@ static int cliSendCommand(int argc, char **argv) {
                 cmd = sdscatlen(cmd,"\r\n",2);
             }
         } else {
+            // 遍历命令和参数，以空格拼接起来 [set, a, b] => set a 1\r\nb\r\n
             for (j = 0; j < argc; j++) {
                 if (j != 0) cmd = sdscat(cmd," ");
+                // 最后一个参数格式为：参数长度\r\n参数内容\r\n
                 if (j == argc-1 && rc->flags & REDIS_CMD_BULK) {
                     cmd = sdscatprintf(cmd,"%lu",
                         (unsigned long)sdslen(argv[j]));
@@ -360,13 +390,14 @@ static int cliSendCommand(int argc, char **argv) {
                 cmd = sdscatlen(cmd,"\r\n",2);
             }
         }
+        // 发送命令
         anetWrite(fd,cmd,sdslen(cmd));
         sdsfree(cmd);
-
+        // 持续消费服务端数据，按行读取并打印
         while (read_forever) {
             cliReadSingleLineReply(fd,0);
         }
-
+        // 一般命令则读取服务端响应
         retval = cliReadReply(fd);
         if (retval) {
             return retval;
@@ -374,38 +405,49 @@ static int cliSendCommand(int argc, char **argv) {
     }
     return 0;
 }
-
+// redis-cli [-h host] [-p port] [-a authpw] [-r repeat_times] [-n db_num] [-i] cmd arg1 arg2 arg3 ... argN
 static int parseOptions(int argc, char **argv) {
     int i;
-
+    // redis-cli xx，从第一个参数 xx 开始解析
     for (i = 1; i < argc; i++) {
+        // 是不是最后一个命令
         int lastarg = i==argc-1;
-
+        // -h 但是不是最后一个字段则表示 host
         if (!strcmp(argv[i],"-h") && !lastarg) {
+            // host 信息
             char *ip = zmalloc(32);
+            // DNS 解析
             if (anetResolve(NULL,argv[i+1],ip) == ANET_ERR) {
                 printf("Can't resolve %s\n", argv[i]);
                 exit(1);
             }
+            // 设置 host 字段
             config.hostip = ip;
             i++;
         } else if (!strcmp(argv[i],"-h") && lastarg) {
+            //  -h 并且是最后一个字段则表示 help
             usage();
         } else if (!strcmp(argv[i],"-p") && !lastarg) {
+            // 端口
             config.hostport = atoi(argv[i+1]);
             i++;
         } else if (!strcmp(argv[i],"-r") && !lastarg) {
+            // 重试次数
             config.repeat = strtoll(argv[i+1],NULL,10);
             i++;
         } else if (!strcmp(argv[i],"-n") && !lastarg) {
+            // 选择哪个 db
             config.dbnum = atoi(argv[i+1]);
             i++;
         } else if (!strcmp(argv[i],"-a") && !lastarg) {
+            // 验证信息
             config.auth = argv[i+1];
             i++;
         } else if (!strcmp(argv[i],"-i")) {
+            // 是否进入交互模式
             config.interactive = 1;
         } else {
+            // 碰到非法配置则推出解析
             break;
         }
     }
@@ -456,8 +498,9 @@ static char *prompt(char *line, int size) {
 
     do {
         printf(">> ");
+        // 读取一行，retval 非 NULL 说明读成功
         retval = fgets(line, size, stdin);
-    } while (retval && *line == '\n');
+    } while (retval && *line == '\n'); // 如果读成功，但是读到的是空行则忽略，继续读，如果读结束或出错则退出 while
     line[strlen(line) - 1] = '\0';
 
     return retval;
@@ -468,7 +511,7 @@ static void repl() {
     char buffer[size];
     char *line = buffer;
     char **ap, *args[max];
-
+    // 需要身份验证
     if (config.auth != NULL) {
         char *authargv[2];
 
@@ -476,7 +519,7 @@ static void repl() {
         authargv[1] = config.auth;
         cliSendCommand(2, convertToSds(2, authargv));
     }
-
+    // 进入交互模式，循环处理命令
     while (prompt(line, size)) {
         argc = 0;
 
@@ -491,6 +534,7 @@ static void repl() {
         }
 
         config.repeat = 1;
+        // 发送命令并打印响应
         cliSendCommand(argc, convertToSds(argc, args));
         line = buffer;
     }
@@ -509,11 +553,14 @@ int main(int argc, char **argv) {
     config.dbnum = 0;
     config.interactive = 0;
     config.auth = NULL;
-
+    // 返回已经解析的参数个数，firstarg 表示第一个 redis 命令
     firstarg = parseOptions(argc,argv);
+    // 记录命令个数
     argc -= firstarg;
+    // 指向命令参数
     argv += firstarg;
-
+    // argc=0 说明命令行参数没有输入命令，则进入进入交互模式
+    // interactive=1说明需要进入交互模式
     if (argc == 0 || config.interactive == 1) repl();
 
     argvcopy = convertToSds(argc, argv);
