@@ -1183,9 +1183,11 @@ void backgroundSaveDoneHandler(int statloc) {
             "Background saving terminated by signal");
         rdbRemoveTempFile(server.bgsavechildpid);
     }
+    // 备份完了重置标记
     server.bgsavechildpid = -1;
     /* Possibly there are slaves waiting for a BGSAVE in order to be served
      * (the first stage of SYNC is a bulk transfer of dump.rdb) */
+    // 同步给 slave，如果有 slave 在等待的话
     updateSlavesWaitingBgsave(exitcode == 0 ? REDIS_OK : REDIS_ERR);
 }
 
@@ -1209,6 +1211,7 @@ void backgroundRewriteDoneHandler(int statloc) {
             goto cleanup;
         }
         /* Flush our data... */
+        // 把执行 aof 期间累积的数据写入 aof
         if (write(fd,server.bgrewritebuf,sdslen(server.bgrewritebuf)) !=
                 (signed) sdslen(server.bgrewritebuf)) {
             redisLog(REDIS_WARNING, "Error or short write trying to flush the parent diff of the append log file in the child temp file: %s", strerror(errno));
@@ -1297,11 +1300,13 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
         closeTimedoutClients();
 
     /* Check if a background saving or AOF rewrite in progress terminated */
+    // 如果正在数据同步或备份
     if (server.bgsavechildpid != -1 || server.bgrewritechildpid != -1) {
         int statloc;
         pid_t pid;
-
+        // 非阻塞判断子进程是否结束了
         if ((pid = wait3(&statloc,WNOHANG,NULL)) != 0) {
+            // 如果结束了，判断是 rdb 还是 aof 进程，进行相应处理
             if (pid == server.bgsavechildpid) {
                 backgroundSaveDoneHandler(statloc);
             } else {
@@ -1314,7 +1319,7 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
          time_t now = time(NULL);
          for (j = 0; j < server.saveparamslen; j++) {
             struct saveparam *sp = server.saveparams+j;
-
+            // 判断是否达到了备份的阈值，修改的 key 数或者太久没有备份了，是的话同步执行备份
             if (server.dirty >= sp->changes &&
                 now-server.lastsave > sp->seconds) {
                 redisLog(REDIS_NOTICE,"%d changes in %d seconds. Saving...",
@@ -1329,6 +1334,7 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
      * will use few CPU cycles if there are few expiring keys, otherwise
      * it will get more aggressive to avoid that too much memory is used by
      * keys that can be removed from the keyspace. */
+    // 渐进式删除过期的键
     for (j = 0; j < server.dbnum; j++) {
         int expired;
         redisDb *db = server.db+j;
@@ -1383,6 +1389,7 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
     }
 
     /* Check if we should connect to a MASTER */
+    // 同步 master 的数据
     if (server.replstate == REDIS_REPL_CONNECT) {
         redisLog(REDIS_NOTICE,"Connecting to MASTER...");
         if (syncWithMaster() == REDIS_OK) {
@@ -2068,7 +2075,7 @@ static void call(redisClient *c, struct redisCommand *cmd) {
     // server.dirty-dirty 非 0 说明该命令的操作需要记录到文件中，比如 get 命令不需要
     if (server.appendonly && server.dirty-dirty)
         feedAppendOnlyFile(cmd,c->db->id,c->argv,c->argc);
-    // 同步到 slave
+    // 如果有写操作，同步到 slave
     if (server.dirty-dirty && listLength(server.slaves))
         replicationFeedSlaves(server.slaves,cmd,c->db->id,c->argv,c->argc);
     // 同步给 monitor 客户端
@@ -2327,6 +2334,7 @@ static void replicationFeedSlaves(list *slaves, struct redisCommand *cmd, int di
             addReply(slave,selectcmd);
             slave->slaveseldb = dictid;
         }
+        // 同步命令信息给 slave
         for (j = 0; j < outc; j++) addReply(slave,outv[j]);
     }
     for (j = 0; j < outc; j++) decrRefCount(outv[j]);
@@ -6712,6 +6720,7 @@ static void monitorCommand(redisClient *c) {
 
     c->flags |= (REDIS_SLAVE|REDIS_MONITOR);
     c->slaveseldb = 0;
+    // 加入 monitor 队列
     listAddNodeTail(server.monitors,c);
     addReply(c,shared.ok);
 }
@@ -7166,7 +7175,7 @@ static int syncReadLine(int fd, char *ptr, ssize_t size, int timeout) {
     }
     return nread;
 }
-
+// 同步数据给 slave，由 slave 主动触发
 static void syncCommand(redisClient *c) {
     /* ignore SYNC if aleady slave or in monitor mode */
     if (c->flags & REDIS_SLAVE) return;
@@ -7175,6 +7184,7 @@ static void syncCommand(redisClient *c) {
      * the client about already issued commands. We need a fresh reply
      * buffer registering the differences between the BGSAVE and the current
      * dataset, so that we can copy to other slaves if needed. */
+    // 正在处理客户端的命令，这时候不能执行 sync 命令
     if (listLength(c->reply) != 0) {
         addReplySds(c,sdsnew("-ERR SYNC is invalid with pending input\r\n"));
         return;
@@ -7183,6 +7193,7 @@ static void syncCommand(redisClient *c) {
     redisLog(REDIS_NOTICE,"Slave ask for synchronization");
     /* Here we need to check if there is a background saving operation
      * in progress, or if it is required to start one */
+    // 已经在执行 rdb 生成操作了，可能是有 slave 发送了 sync 命令或者客户端发送了 bgsave 命令
     if (server.bgsavechildpid != -1) {
         /* Ok a background save is in progress. Let's check if it is a good
          * one for replication, i.e. if there is another slave that is
@@ -7192,10 +7203,12 @@ static void syncCommand(redisClient *c) {
         listIter li;
 
         listRewind(server.slaves,&li);
+        // 看是否已经有 slave 已经发送了 sync 命令，并且已经生成了 rdb
         while((ln = listNext(&li))) {
             slave = ln->value;
             if (slave->replstate == REDIS_REPL_WAIT_BGSAVE_END) break;
         }
+        // 有的话共用
         if (ln) {
             /* Perfect, the server is already registering differences for
              * another slave. Set the right state, and copy the buffer. */
@@ -7206,17 +7219,20 @@ static void syncCommand(redisClient *c) {
         } else {
             /* No way, we need to wait for the next BGSAVE in order to
              * register differences */
+            // 没有的话等待处理
             c->replstate = REDIS_REPL_WAIT_BGSAVE_START;
             redisLog(REDIS_NOTICE,"Waiting for next BGSAVE for SYNC");
         }
     } else {
         /* Ok we don't have a BGSAVE in progress, let's start one */
         redisLog(REDIS_NOTICE,"Starting BGSAVE for SYNC");
+        // 异步生成 rdb
         if (rdbSaveBackground(server.dbfilename) != REDIS_OK) {
             redisLog(REDIS_NOTICE,"Replication failed, can't BGSAVE");
             addReplySds(c,sdsnew("-ERR Unalbe to perform background save\r\n"));
             return;
         }
+        // 执行 rdb 生成操作了，等待发送，在定时器里处理，参考 backgroundSaveDoneHandler
         c->replstate = REDIS_REPL_WAIT_BGSAVE_END;
     }
     c->repldbfd = -1;
@@ -7294,11 +7310,12 @@ static void updateSlavesWaitingBgsave(int bgsaveerr) {
     listRewind(server.slaves,&li);
     while((ln = listNext(&li))) {
         redisClient *slave = ln->value;
-
+        // 如果 slave 在等待 rdb 同步（执行了 sync 命令）
         if (slave->replstate == REDIS_REPL_WAIT_BGSAVE_START) {
             startbgsave = 1;
             slave->replstate = REDIS_REPL_WAIT_BGSAVE_END;
         } else if (slave->replstate == REDIS_REPL_WAIT_BGSAVE_END) {
+            // 如果
             struct redis_stat buf;
            
             if (bgsaveerr != REDIS_OK) {
@@ -7316,6 +7333,7 @@ static void updateSlavesWaitingBgsave(int bgsaveerr) {
             slave->repldbsize = buf.st_size;
             slave->replstate = REDIS_REPL_SEND_BULK;
             aeDeleteFileEvent(server.el,slave->fd,AE_WRITABLE);
+            // 注册写事件，等待发送
             if (aeCreateFileEvent(server.el, slave->fd, AE_WRITABLE, sendBulkToSlave, slave) == AE_ERR) {
                 freeClient(slave);
                 continue;
@@ -7341,6 +7359,7 @@ static void updateSlavesWaitingBgsave(int bgsaveerr) {
 static int syncWithMaster(void) {
     char buf[1024], tmpfile[256], authcmd[1024];
     long dumpsize;
+    // 连接到 master
     int fd = anetTcpConnect(NULL,server.masterhost,server.masterport);
     int dfd, maxtries = 5;
 
@@ -7351,6 +7370,7 @@ static int syncWithMaster(void) {
     }
 
     /* AUTH with the master if required. */
+    // master 需要验证
     if(server.masterauth) {
     	snprintf(authcmd, 1024, "AUTH %s\r\n", server.masterauth);
     	if (syncWrite(fd, authcmd, strlen(server.masterauth)+7, 5) == -1) {
@@ -7374,6 +7394,7 @@ static int syncWithMaster(void) {
     }
 
     /* Issue the SYNC command */
+    // 发送 sync 命令同步数据
     if (syncWrite(fd,"SYNC \r\n",7,5) == -1) {
         close(fd);
         redisLog(REDIS_WARNING,"I/O error writing to MASTER: %s",
@@ -7381,6 +7402,7 @@ static int syncWithMaster(void) {
         return REDIS_ERR;
     }
     /* Read the bulk write count */
+    // 读取响应
     if (syncReadLine(fd,buf,1024,3600) == -1) {
         close(fd);
         redisLog(REDIS_WARNING,"I/O error reading bulk count from MASTER: %s",
@@ -7392,9 +7414,11 @@ static int syncWithMaster(void) {
         redisLog(REDIS_WARNING,"Bad protocol from MASTER, the first byte is not '$', are you sure the host and port are right?");
         return REDIS_ERR;
     }
+    // 需要同步的数据大小
     dumpsize = strtol(buf+1,NULL,10);
     redisLog(REDIS_NOTICE,"Receiving %ld bytes data dump from MASTER",dumpsize);
     /* Read the bulk write data on a temp file */
+    // 创建 rdb 文件，准备同步 master 数据
     while(maxtries--) {
         snprintf(tmpfile,256,
             "temp-%d.%ld.rdb",(int)time(NULL),(long int)getpid());
@@ -7407,6 +7431,7 @@ static int syncWithMaster(void) {
         redisLog(REDIS_WARNING,"Opening the temp file needed for MASTER <-> SLAVE synchronization: %s",strerror(errno));
         return REDIS_ERR;
     }
+    // 把 master 发送过来的数据写入 rdb 文件
     while(dumpsize) {
         int nread, nwritten;
 
@@ -7440,6 +7465,7 @@ static int syncWithMaster(void) {
         close(fd);
         return REDIS_ERR;
     }
+    // 记录和 master 的连接
     server.master = createClient(fd);
     server.master->flags |= REDIS_MASTER;
     server.master->authenticated = 1;
@@ -7448,16 +7474,19 @@ static int syncWithMaster(void) {
 }
 
 static void slaveofCommand(redisClient *c) {
+    // no one 表示退出 slave 角色
     if (!strcasecmp(c->argv[1]->ptr,"no") &&
         !strcasecmp(c->argv[2]->ptr,"one")) {
         if (server.masterhost) {
             sdsfree(server.masterhost);
             server.masterhost = NULL;
+            // 关闭和 master 的连接
             if (server.master) freeClient(server.master);
             server.replstate = REDIS_REPL_NONE;
             redisLog(REDIS_NOTICE,"MASTER MODE enabled (user request)");
         }
     } else {
+        // 成为新 master 的 slave
         sdsfree(server.masterhost);
         server.masterhost = sdsdup(c->argv[1]->ptr);
         server.masterport = atoi(c->argv[2]->ptr);
@@ -7601,6 +7630,7 @@ static void feedAppendOnlyFile(struct redisCommand *cmd, int dictid, robj **argv
      * While this will save us against the server being killed I don't think
      * there is much to do about the whole server stopping for power problems
      * or alike */
+    // 写入 aof 文件
      nwritten = write(server.appendfd,buf,sdslen(buf));
      if (nwritten != (signed)sdslen(buf)) {
         /* Ooops, we are in troubles. The best thing to do for now is
@@ -7617,11 +7647,14 @@ static void feedAppendOnlyFile(struct redisCommand *cmd, int dictid, robj **argv
      * accumulate the differences between the child DB and the current one
      * in a buffer, so that when the child process will do its work we
      * can append the differences to the new append only file. */
+    // 正在执行 aof 重写则先缓存起来，重写完后再写入新的 aof 文件，然后重置 aof 文件为重写后的 aof 文件
+    // 但是上面依然需要先写入旧的 aof 文件，因为重写可能失败
     if (server.bgrewritechildpid != -1)
         server.bgrewritebuf = sdscatlen(server.bgrewritebuf,buf,sdslen(buf));
 
     sdsfree(buf);
     now = time(NULL);
+    // 实时刷盘 或者 每秒刷一次且到了刷盘时间
     if (server.appendfsync == APPENDFSYNC_ALWAYS ||
         (server.appendfsync == APPENDFSYNC_EVERYSEC &&
          now-server.lastfsync > 1))
@@ -7840,10 +7873,12 @@ static int rewriteAppendOnlyFile(char *filename) {
         }
 
         /* SELECT the new DB */
+        // 先写入选择 db 命令，保证后续的数据是该 db 的
         if (fwrite(selectcmd,sizeof(selectcmd)-1,1,fp) == 0) goto werr;
         if (fwriteBulkLong(fp,j) == 0) goto werr;
 
         /* Iterate this DB writing every entry */
+        // 把 db 的数据写到新的 aof 文件
         while((de = dictNext(di)) != NULL) {
             robj *key, *o;
             time_t expiretime;
@@ -7862,11 +7897,13 @@ static int rewriteAppendOnlyFile(char *filename) {
                 o = vmPreviewObject(key);
                 swapped = 1;
             }
+            // 判断 key 是否设置了过期时间
             expiretime = getExpire(db,key);
 
             /* Save the key and associated value */
             if (o->type == REDIS_STRING) {
                 /* Emit a SET command */
+                // 写入 set key value 的值
                 char cmd[]="*3\r\n$3\r\nSET\r\n";
                 if (fwrite(cmd,sizeof(cmd)-1,1,fp) == 0) goto werr;
                 /* Key and value */
@@ -7879,6 +7916,7 @@ static int rewriteAppendOnlyFile(char *filename) {
                 listIter li;
 
                 listRewind(list,&li);
+                // 写入队列里的每个元素
                 while((ln = listNext(&li))) {
                     char cmd[]="*3\r\n$5\r\nRPUSH\r\n";
                     robj *eleobj = listNodeValue(ln);
@@ -7894,6 +7932,7 @@ static int rewriteAppendOnlyFile(char *filename) {
                 dictEntry *de;
 
                 while((de = dictNext(di)) != NULL) {
+                    // * 表示是数组，长度为 3，第一行是 SADD，$4 表示 “SADD” 长度，加上后面的 kv
                     char cmd[]="*3\r\n$4\r\nSADD\r\n";
                     robj *eleobj = dictGetEntryKey(de);
 
@@ -7909,6 +7948,7 @@ static int rewriteAppendOnlyFile(char *filename) {
                 dictEntry *de;
 
                 while((de = dictNext(di)) != NULL) {
+                    // * 表示是数组，长度为 4，第一行是 ZADD，$4 表示 “ZADD” 长度，加上后面的 key score value
                     char cmd[]="*4\r\n$4\r\nZADD\r\n";
                     robj *eleobj = dictGetEntryKey(de);
                     double *score = dictGetEntryVal(de);
@@ -7920,6 +7960,7 @@ static int rewriteAppendOnlyFile(char *filename) {
                 }
                 dictReleaseIterator(di);
             } else if (o->type == REDIS_HASH) {
+                // * 表示是数组，长度为 4，第一行是 HSET，$4 表示 “HSET” 长度，加上后面的 hash_table_name key value
                 char cmd[]="*4\r\n$4\r\nHSET\r\n";
 
                 /* Emit the HSETs needed to rebuild the hash */
@@ -8040,7 +8081,7 @@ static int rewriteAppendOnlyFileBackground(void) {
     }
     return REDIS_OK; /* unreached */
 }
-
+// 异步重写 aof
 static void bgrewriteaofCommand(redisClient *c) {
     if (server.bgrewritechildpid != -1) {
         addReplySds(c,sdsnew("-ERR background append only file rewriting already in progress\r\n"));

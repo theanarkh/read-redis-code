@@ -351,7 +351,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
         }
     }
     /* Check time events */
-    // 初始化定时器
+    // 处理定时器
     if (flags & AE_TIME_EVENTS)
         processed += processTimeEvents(eventLoop);
 
