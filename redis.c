@@ -3074,20 +3074,24 @@ static int rdbSaveTime(FILE *fp, time_t t) {
 /* check rdbLoadLen() comments for more info */
 static int rdbSaveLen(FILE *fp, uint32_t len) {
     unsigned char buf[2];
-
+    // 储存格式参考 REDIS_RDB_6BITLEN 的注释
+    // 小于 6 位则直接储
     if (len < (1<<6)) {
         /* Save a 6 bit len */
         buf[0] = (len&0xFF)|(REDIS_RDB_6BITLEN<<6);
         if (fwrite(buf,1,1,fp) == 0) return -1;
     } else if (len < (1<<14)) {
+        // 小于 14 位则第一个字节：高两位存标记01，低6位部分长度信息，第二个字节也存部分长度信息，拼起来解释
         /* Save a 14 bit len */
         buf[0] = ((len>>8)&0xFF)|(REDIS_RDB_14BITLEN<<6);
         buf[1] = len&0xFF;
         if (fwrite(buf,2,1,fp) == 0) return -1;
     } else {
         /* Save a 32 bit len */
+        // REDIS_RDB_32BITLEN = 二进制1和0
         buf[0] = (REDIS_RDB_32BITLEN<<6);
         if (fwrite(buf,1,1,fp) == 0) return -1;
+        // 把长度写入下一个字节
         len = htonl(len);
         if (fwrite(&len,4,1,fp) == 0) return -1;
     }
@@ -3205,6 +3209,7 @@ static int rdbSaveStringObject(FILE *fp, robj *obj) {
         retval = rdbSaveRawString(fp,obj->ptr,sdslen(obj->ptr));
         decrRefCount(obj);
     } else {
+        // obj->ptr 指向字符串
         retval = rdbSaveRawString(fp,obj->ptr,sdslen(obj->ptr));
     }
     return retval;
@@ -3374,12 +3379,16 @@ static int rdbSave(char *filename) {
         while((de = dictNext(di)) != NULL) {
             robj *key = dictGetEntryKey(de);
             robj *o = dictGetEntryVal(de);
+            // 获取 key 的过期时间
             time_t expiretime = getExpire(db,key);
 
             /* Save the expire time */
+            // 有则判断是否过期
             if (expiretime != -1) {
                 /* If this key is already expired skip it */
+                // 过期了就不需要处理了
                 if (expiretime < now) continue;
+                // 否则写入类型信息，写入过期时间
                 if (rdbSaveType(fp,REDIS_EXPIRETIME) == -1) goto werr;
                 if (rdbSaveTime(fp,expiretime) == -1) goto werr;
             }
@@ -4361,13 +4370,16 @@ static void moveCommand(redisClient *c) {
 static void pushGenericCommand(redisClient *c, int where) {
     robj *lobj;
     list *list;
-
+    // 找到 xpush 命令对应的列表
     lobj = lookupKeyWrite(c->db,c->argv[1]);
+    // 还不存在
     if (lobj == NULL) {
+        // 判断是否有客户端在等待消费该 key 的数据，有则直接消费，不需要存储
         if (handleClientsWaitingListPush(c,c->argv[1],c->argv[2])) {
             addReply(c,shared.cone);
             return;
         }
+        // 创建列表并插入新元素
         lobj = createListObject();
         list = lobj->ptr;
         if (where == REDIS_HEAD) {
@@ -4375,6 +4387,7 @@ static void pushGenericCommand(redisClient *c, int where) {
         } else {
             listAddNodeTail(list,c->argv[2]);
         }
+        // 写入到字典中，key 是列表名称，值是一个列表
         dictAdd(c->db->dict,c->argv[1],lobj);
         incrRefCount(c->argv[1]);
         incrRefCount(c->argv[2]);
@@ -4383,6 +4396,7 @@ static void pushGenericCommand(redisClient *c, int where) {
             addReply(c,shared.wrongtypeerr);
             return;
         }
+        // 判断是否有客户端在等待消费该 key 的数据，有则直接消费，不需要存储
         if (handleClientsWaitingListPush(c,c->argv[1],c->argv[2])) {
             addReply(c,shared.cone);
             return;
@@ -4403,6 +4417,7 @@ static void lpushCommand(redisClient *c) {
     pushGenericCommand(c,REDIS_HEAD);
 }
 
+// 从队列尾部新增一个元素
 static void rpushCommand(redisClient *c) {
     pushGenericCommand(c,REDIS_TAIL);
 }
@@ -6962,7 +6977,7 @@ static void blockForKeys(redisClient *c, robj **keys, int numkeys, time_t timeou
     dictEntry *de;
     list *l;
     int j;
-
+    // 记录阻塞的 key 列表，个数，超时时间
     c->blockingkeys = zmalloc(sizeof(robj*)*numkeys);
     c->blockingkeysnum = numkeys;
     c->blockingto = timeout;
@@ -6972,6 +6987,7 @@ static void blockForKeys(redisClient *c, robj **keys, int numkeys, time_t timeou
         incrRefCount(keys[j]);
 
         /* And in the other "side", to map keys -> clients */
+        // 在阻塞字典中记录阻塞 key 和客户端的映射关系，一个 key 对应一个被阻塞的客户端列表
         de = dictFind(c->db->blockingkeys,keys[j]);
         if (de == NULL) {
             int retval;
@@ -6999,11 +7015,14 @@ static void unblockClientWaitingData(redisClient *c) {
 
     assert(c->blockingkeys != NULL);
     /* The client may wait for multiple keys, so unblock it for every key. */
+    // 客户端可以一次阻塞在多个 key 中，遍历这些 key
     for (j = 0; j < c->blockingkeysnum; j++) {
         /* Remove this client from the list of clients waiting for this key. */
+        // 从阻塞字典找到该客户端阻塞key对应列表
         de = dictFind(c->db->blockingkeys,c->blockingkeys[j]);
         assert(de != NULL);
         l = dictGetEntryVal(de);
+        // 把客户端从等待队列删除
         listDelNode(l,listSearchKey(l,c));
         /* If the list is empty we need to remove it to avoid wasting memory */
         if (listLength(l) == 0)
@@ -7020,6 +7039,7 @@ static void unblockClientWaitingData(redisClient *c) {
      * unblockClientWaitingData() gets called from freeClient() because
      * freeClient() will be smart enough to call this function
      * *after* c->querybuf was set to NULL. */
+    // 如果客户端在发送阻塞请求后后又发送了信息，则会缓存起来，解除阻塞后需要进行处理
     if (c->querybuf && sdslen(c->querybuf) > 0) processInputBuffer(c);
 }
 
@@ -7038,12 +7058,14 @@ static int handleClientsWaitingListPush(redisClient *c, robj *key, robj *ele) {
     redisClient *receiver;
     list *l;
     listNode *ln;
-
+    // 从阻塞字典中找到该 key 对应的值，值为阻塞在该 key 的客户端列表
     de = dictFind(c->db->blockingkeys,key);
     if (de == NULL) return 0;
+    // 是一个列表
     l = dictGetEntryVal(de);
     ln = listFirst(l);
     assert(ln != NULL);
+    // 直接发送给第一个客户端，不需要存储起来
     receiver = ln->value;
 
     addReplySds(receiver,sdsnew("*2\r\n"));
@@ -7058,8 +7080,11 @@ static void blockingPopGenericCommand(redisClient *c, int where) {
     robj *o;
     time_t timeout;
     int j;
-
+    // 遍历所有的 key，如果每个 key 对应的队列都非空则从每个队列中 pop 一个元素返回给客户端，
+    // 当碰到一个key对应的队列为空，则
+    // 最后一个参数是超时时间，所以是 j < c->argc-1
     for (j = 1; j < c->argc-1; j++) {
+        // 查找该 key 对应的队列
         o = lookupKeyWrite(c->db,c->argv[j]);
         if (o != NULL) {
             if (o->type != REDIS_LIST) {
@@ -7067,6 +7092,7 @@ static void blockingPopGenericCommand(redisClient *c, int where) {
                 return;
             } else {
                 list *list = o->ptr;
+                // 队列非空则直接把元素出队返回给客户端
                 if (listLength(list) != 0) {
                     /* If the list contains elements fall back to the usual
                      * non-blocking POP operation */
@@ -7077,7 +7103,10 @@ static void blockingPopGenericCommand(redisClient *c, int where) {
                      * popGenericCommand() as the command takes a single key. */
                     orig_argv = c->argv;
                     orig_argc = c->argc;
+                    // 队列名称
                     argv[1] = c->argv[j];
+                    // 设置 pop 命令需要处理的参数，argv[0] 是命令名称，不需要设置，
+                    // 只需要设置 pop xxx 中队列的名字，即 xxx
                     c->argv = argv;
                     c->argc = 2;
 
@@ -7087,7 +7116,9 @@ static void blockingPopGenericCommand(redisClient *c, int where) {
                      * for us. If this souds like an hack to you it's just
                      * because it is... */
                     addReplySds(c,sdsnew("*2\r\n"));
+                    // 说明数据来自哪个队列（队列名称）
                     addReplyBulk(c,argv[1]);
+                    // 根据上面设置的命令，从队列中 pop 出一个元素给客户端
                     popGenericCommand(c,where);
 
                     /* Fix the client structure with the original stuff */
@@ -7099,8 +7130,10 @@ static void blockingPopGenericCommand(redisClient *c, int where) {
         }
     }
     /* If the list is empty or the key does not exists we must block */
+    // 超时时间
     timeout = strtol(c->argv[c->argc-1]->ptr,NULL,10);
     if (timeout > 0) timeout += time(NULL);
+    // 阻塞在 c->argv+1 开始的 key 列表，长度为 c->argc-2
     blockForKeys(c,c->argv+1,c->argc-2,timeout);
 }
 

@@ -233,6 +233,7 @@ int dictAdd(dict *ht, void *key, void *val)
     /* Allocates the memory and stores key */
     // 分配内存并插入链表
     entry = _dictAlloc(sizeof(*entry));
+    // 头插法，插入对应的桶的前面
     entry->next = ht->table[index];
     ht->table[index] = entry;
 
@@ -249,6 +250,7 @@ int dictAdd(dict *ht, void *key, void *val)
  * Return 1 if the key was added from scratch, 0 if there was already an
  * element with such key and dictReplace() just performed a value update
  * operation. */
+// 替换 key 的值为 val，key 不存在则新增，存在则覆盖
 int dictReplace(dict *ht, void *key, void *val)
 {
     dictEntry *entry, auxentry;
@@ -265,8 +267,11 @@ int dictReplace(dict *ht, void *key, void *val)
      * as the previous one. In this context, think to reference counting,
      * you want to increment (set), and then decrement (free), and not the
      * reverse. */
+    // 复制原来项的内容
     auxentry = *entry;
+    // 设置新值
     dictSetHashVal(ht, entry, val);
+    // 释放旧值
     dictFreeEntryVal(ht, &auxentry);
     return 0;
 }
@@ -358,10 +363,12 @@ dictEntry *dictFind(dict *ht, const void *key)
 {
     dictEntry *he;
     unsigned int h;
-
+    // 哈希表没有元素直接返回
     if (ht->size == 0) return NULL;
     h = dictHashKey(ht, key) & ht->sizemask;
+    // 找到对应的桶
     he = ht->table[h];
+    // 遍历链表找 key对应的项
     while(he) {
         if (dictCompareHashKeys(ht, key, he->key))
             return he;
